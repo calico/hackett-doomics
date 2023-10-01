@@ -1,0 +1,1252 @@
+---
+title: "Figure 3 - Statistical Analysis and Functional Enrichment"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(
+  outdir = file.path(params$cache_dir, "data"),
+  overwrite = FALSE
+  )
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+features_with_design <- load_domics("features", domics_paths)
+
+# models fits for just selected coefficients
+feature_signif <- load_domics("signif", domics_paths) %>%
+  filter(
+    data_modality %in% c("lipidomics", "metabolomics", "proteomics")
+    ) %>%
+  # rename fraction of life lived x sex
+  mutate(term = ifelse(term == "fraction of life lived x sex", "fraction of life lived x male", term))
+  
+# all models fit
+all_model_signif <- load_domics("all_model_signif", domics_paths) %>%
+  dplyr::filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
+
+# summaries of features and samples
+features <- romic::get_tomic_table(tidy_omics, "features") %>%
+  add_feature_label(feature_design_list) %>%
+  filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
+samples <- romic::get_tomic_table(tidy_omics, "samples")
+
+# script-specific imports and configuration
+library(patchwork) # for combining grobs
+library(ggtext) # for markdown in grobs
+# load the shiny app's feature-level plotting functions
+source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+
+# overwrite cached results
+overwrite = FALSE
+```
+
+## P-Value Histograms
+
+```{r pvalues, fig.width = 5, fig.height = 15}
+# cleanup term labels
+
+term_labels <- feature_signif %>%
+  filter(q.value < 0.1) %>%
+  count(term) %>%
+  arrange(desc(n)) %>%
+  mutate(
+    term_label = stringr::str_wrap(stringr::str_to_title(term), 25),
+    term_label = ifelse(term == "ddm", "DDM", term_label),
+    term_label = factor(term_label, levels = term_label)
+    ) %>%
+  dplyr::rename(n_signif = n) %>%
+  filter(!(term %in% c("early G8", "late blood draw")))
+
+combined_pvalue_histograms <- feature_signif %>%
+  filter(!is.na(q.value)) %>%
+  inner_join(term_labels, by = "term") %>%
+  mutate(is_signif = ifelse(q.value < 0.1, "q < 0.1", "n.s.")) %>%
+  ggplot(aes(x = pvalue_bs)) +
+  geom_histogram(aes(fill = is_signif), breaks = seq(0, 1, by = 0.04)) +
+  geom_text(data = term_labels, aes(label = n_signif, y = 250 + n_signif*0.4), x = 0.05, hjust = 0, color = "#5BB867") +
+  facet_grid(term_label ~ ., scale = "free", space = "free") +
+  scale_x_continuous("p-value", expand = c(0,0)) +
+  scale_y_continuous("# of molecules", breaks = seq(0, 1200, by = 200)) +
+  scale_fill_manual("Significance", values = c("q < 0.1" = "#5BB867", "n.s." = "gray40")) +
+  theme_minimal() +
+  theme(legend.position = "bottom", text = element_text(size = 20),
+        axis.text.x = element_text(angle = 60, hjust = 1), 
+        strip.background = element_rect(fill = "gray90"),
+        strip.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 8),
+        panel.spacing = grid::unit(1, "lines"),
+        panel.grid.minor = element_blank(),
+        legend.text=element_text(size=8)) +
+  expand_limits(x = c(0, 1), y = c(0, 500))
+
+combined_pvalue_histograms
+create_and_upload_figure(
+  name = "combined_pvalue_histograms",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 5,
+  height = 15,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+```{r archetype_hits}
+feature_signif %>%
+  filter(q.value < 0.1) %>%
+  filter(term %in% c("early age", "fraction of life lived", "late age", "late age x lifespan", "lifespan", "lifespan remaining")) %>%
+  distinct(data_modality, data_type, groupId) %>%
+  {glue::glue("{nrow(.)} features are associated with 1+ aging archetypes")}
+```
+
+```{r pvalues_by_datamodality, fig.width = 8, fig.height = 15}
+data_modality_specific_signif <- feature_signif %>%
+  dplyr::filter(q.value < 0.1) %>%
+  dplyr::count(term, data_modality) %>%
+  dplyr::left_join(term_labels %>% dplyr::select(-n_signif), by = "term") %>%
+  dplyr::rename(n_signif = n) %>%
+  dplyr::filter(!(term %in% c("early G8", "late blood draw")))
+
+data_modality_specific_pvalue_histograms <- feature_signif %>%
+  dplyr::filter(!is.na(q.value)) %>%
+  dplyr::inner_join(term_labels, by = "term") %>%
+  dplyr::mutate(is_signif = ifelse(q.value < 0.1, "q < 0.1", "n.s.")) %>%
+  ggplot(aes(x = pvalue_bs)) +
+  geom_histogram(aes(fill = is_signif), breaks = seq(0, 1, by = 0.04)) +
+  geom_text(data = data_modality_specific_signif, aes(label = n_signif, y = 90 + n_signif*0.4), x = 0.06, hjust = 0, color = "#5BB867") +
+  facet_grid(term_label ~ data_modality, scale = "free", space = "free") +
+  scale_x_continuous("p-value", expand = c(0,0)) +
+  scale_y_continuous("# of molecules", breaks = seq(0, 1200, by = 200)) +
+  scale_fill_manual("Significance", values = c("q < 0.1" = "#5BB867", "n.s." = "gray40")) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 15),
+        axis.text.x = element_text(angle = 60, hjust = 1), 
+        strip.background = element_rect(fill = "gray90"),
+        strip.text.y = element_text(size = 12),
+        strip.text.x = element_text(size = 15),
+        panel.spacing = grid::unit(0.5, "lines"),
+        panel.grid.minor = element_blank(),
+        legend.text=element_text(size=15)) +
+  expand_limits(x = c(0, 1), y = c(0, 150))
+
+data_modality_specific_pvalue_histograms
+create_and_upload_figure(
+  name = "data_modality_specific_pvalue_histograms",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 8,
+  height = 15,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+
+```{r term_signif_barplot, fig.width = 7, fig.height = 6}
+term_signif_barplot <- feature_signif %>%
+  dplyr::filter(!is.na(q.value)) %>%
+  dplyr::inner_join(term_labels, by = "term") %>%
+  dplyr::filter(q.value < 0.1) %>%
+  count(data_modality, term_label) %>%
+  ggplot(aes(x = term_label, y = n, fill = data_modality)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous("# of significant features") +
+  scale_x_discrete("Regression term", limits=rev) +
+  scale_fill_manual(
+    "Data Modality",
+    values = c("proteomics" = "royalblue1", "metabolomics" = "red3", "lipidomics" = "limegreen"),
+    breaks = c("proteomics", "metabolomics", "lipidomics")
+    ) +
+  theme_bw() +
+  coord_flip() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 15))
+
+term_signif_barplot
+create_and_upload_figure(
+  name = "term_signif_barplot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3",
+  width = 7,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+```{r lifespan_measures_plots, fig.height = 6, fig.width = 10}
+lifespan_vs_fll_grob <- samples %>%
+  dplyr::filter(!is_ddm_sample) %>%
+  ggplot(aes(y = fraction_of_life_lived, x = lifespan_remaining)) +
+  geom_point(aes(color = Age)) +
+  scale_x_continuous("Lifespan remaining (days)") +
+  scale_y_continuous("Fraction of life lived") +
+  scale_color_manual("Chronological age", values = c("8 months" = "goldenrod1", "14 months" = "darkorange2", "20 months" = "darkred")) +
+  theme_bw() +
+  theme(legend.direction="horizontal", legend.position = "bottom") +
+  guides(color=guide_legend(override.aes = list(size=5)))
+
+lifespan_remaining_vs_fll_grob <- samples %>%
+  dplyr::filter(!is_ddm_sample) %>%
+  ggplot(aes(y = fraction_of_life_lived, x = lifespan)) +
+  geom_point(aes(color = Age)) +
+  scale_x_continuous("Lifespan (days)") +
+  scale_y_continuous(NULL) +
+  scale_color_manual("Chronological age", values = c("8 months" = "goldenrod1", "14 months" = "darkorange2", "20 months" = "darkred")) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# plot correlations between archetype measures
+
+measure_corr_df <- samples %>%
+  dplyr::filter(!is_ddm_sample) %>%
+  mutate(age_by_lifespan = blood_draw_age_actual * lifespan) %>%
+  select(lifespan, `chronological age` = blood_draw_age_actual, `fraction of\nlife lived` = fraction_of_life_lived, `lifespan\nremaining` = lifespan_remaining) %>%
+  as.matrix() %>%
+  cor() %>%
+  as.data.frame() %>%
+  mutate(feature_1 = rownames(.)) %>%
+  gather(feature_2, corr, -feature_1) %>%
+  filter(feature_1 < feature_2)
+
+measure_corrs_grob <- measure_corr_df %>%
+  mutate(
+    corr_sign = ifelse(corr > 0, "corr", "anticorr"),
+    corr_mag = abs(corr) * 10,
+    corr_label = glue::glue("r = {round(corr, 2)}")
+    ) %>%
+  igraph::graph_from_data_frame(directed = FALSE) %>%
+  ggraph::ggraph(layout = 'igraph', algorithm = 'star') +
+  ggraph::geom_edge_link(aes(color = corr_sign, width = corr_mag, label = corr_label)) +
+  ggraph::geom_node_label(aes(label = name)) +
+  ggraph::scale_edge_color_manual(
+    values = c("corr" = "yellow", "anticorr" = "steelblue1")
+    ) +
+  ggraph::scale_edge_width_identity() +
+  theme_void() +
+  expand_limits(x = c(-0.7,1.1)) +
+  theme(legend.position = "none")
+
+# combine all three plots above
+
+meaure_corrs_patchwork_grob <- lifespan_remaining_vs_fll_grob + lifespan_vs_fll_grob + measure_corrs_grob + guide_area() +
+  plot_layout(
+    guides = "collect",
+    heights = c(5, 0.5),
+    widths = c(1, 1, 1.5),
+    design = c(
+      "
+      ABC
+      DDC
+      "
+    ))
+    
+meaure_corrs_patchwork_grob
+create_and_upload_figure(
+  name = "meaure_corrs_patchwork_grob",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 13,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png")
+)
+```
+
+## Compare coefficients when estimating a term different ways
+
+### Fold-change versus abundances
+
+```{r fold_changes_vs_abundances}
+all_model_signif %>%
+  dplyr::filter(term == "late age") %>%
+  mutate(
+    model_shortname = case_when(
+      model_name == "fold-change lm (age), no DDM" ~ "fold-changes",
+      model_name == "cross-sectional lm (age), no DDM" ~ "abundances",
+      TRUE ~ NA
+    )) %>%
+  filter(!is.na(model_shortname)) %>%
+  mutate(signed_nlog10p = calculate_signed_nlog10p(estimate, pvalue_bs)) %>%
+  select(model_shortname, data_type, groupId, signed_nlog10p) %>%
+  spread(model_shortname, signed_nlog10p) %>%
+  ggplot(aes(x = `fold-changes`, y = abundances)) +
+  geom_point(size = 0.2) +
+  ggtitle("Age effects differ based on whether they are estimated on fold-changes or abundances", subtitle = "This is likely because fold-changes use treatment contrasts while abundances use Helmert contrasts")
+
+all_model_signif %>%
+  dplyr::filter(term == "late age x lifespan") %>%
+  mutate(
+    model_shortname = case_when(
+      model_name == "fold-change lm (age x lifespan), no DDM" ~ "fold-changes",
+      model_name == "cross-sectional lm (age x lifespan), no DDM" ~ "abundances",
+      TRUE ~ NA
+    )) %>%
+  filter(!is.na(model_shortname)) %>%
+  mutate(signed_nlog10p = calculate_signed_nlog10p(estimate, pvalue_bs)) %>%
+  select(model_shortname, data_type, groupId, signed_nlog10p) %>%
+  spread(model_shortname, signed_nlog10p) %>%
+  ggplot(aes(x = `fold-changes`, y = abundances)) +
+  geom_point(size = 0.2) +
+  geom_abline(color = "RED") +
+  ggtitle("Age x lifespan interactions are similar whether estimated on fold-changes or abundances")
+```
+
+### Linear vs. categorical description of age
+
+```{r linear_vs_categorical_age}
+all_model_signif %>%
+  dplyr::filter(term %in% c("age", "late age")) %>%
+  mutate(
+    model_shortname = case_when(
+      model_name == "cross-sectional lm (int-age), no DDM" ~ "numeric age",
+      model_name == "cross-sectional lm (age), no DDM" ~ "categorical age",
+      TRUE ~ NA
+    )) %>%
+  filter(!is.na(model_shortname)) %>%
+  mutate(signed_nlog10p = calculate_signed_nlog10p(estimate, pvalue_bs)) %>%
+  select(model_shortname, data_type, groupId, signed_nlog10p) %>%
+  spread(model_shortname, signed_nlog10p) %>%
+  ggplot(aes(x = `categorical age`, y = `numeric age`)) +
+  geom_point(size = 0.2) +
+  geom_abline(color = "RED") +
+  ggtitle("Age effects are similar whether estimating age as a categorical or numeric variable")
+
+all_model_signif %>%
+  dplyr::filter(term %in% c("age x lifespan", "late age x lifespan")) %>%
+  mutate(
+    model_shortname = case_when(
+      model_name == "cross-sectional lm (int-age x lifespan), no DDM" ~ "numeric age x lifespan",
+      model_name == "cross-sectional lm (age x lifespan), no DDM" ~ "categorical age x lifespan",
+      TRUE ~ NA
+    )) %>%
+  filter(!is.na(model_shortname)) %>%
+  mutate(signed_nlog10p = calculate_signed_nlog10p(estimate, pvalue_bs)) %>%
+  select(model_shortname, data_type, groupId, signed_nlog10p) %>%
+  spread(model_shortname, signed_nlog10p) %>%
+  ggplot(aes(x = `categorical age x lifespan`, y = `numeric age x lifespan`)) +
+  geom_point(size = 0.2) +
+  geom_abline(color = "RED") +
+  ggtitle("Age x lifespan interactions are similar whether estimating age as a categorical or numeric variable")
+```
+
+### Age* as a covariate for lifespan
+
+```{r lifespan_covariates}
+lifespan_mods <- all_model_signif %>%
+  dplyr::filter(term == "lifespan") %>%
+  mutate(
+    model_shortname = case_when(
+      model_name == "cross-sectional lm (lifespan), no DDM" ~ "no covariates",
+      model_name == "cross-sectional lm (age + lifespan), no DDM" ~ "lifespan | age",
+      model_name == "cross-sectional lm (fll + lifespan), no DDM" ~ "lifespan | fll",
+      TRUE ~ NA
+    )) %>%
+  filter(!is.na(model_shortname)) %>%
+  mutate(signed_nlog10p = calculate_signed_nlog10p(estimate, pvalue_bs)) %>%
+  select(model_shortname, data_type, groupId, signed_nlog10p) %>%
+  spread(model_shortname, signed_nlog10p)
+
+ggplot(lifespan_mods, aes(x = `lifespan | age`, y = `lifespan | fll`)) +
+  geom_point(size = 0.2) +
+  geom_abline(color = "RED") +
+  ggtitle("Lifespan estimates are quite different based on whether age or fll are included as covariates")
+
+ggplot(lifespan_mods, aes(x = `no covariates`, y = `lifespan | age`)) +
+  geom_point(size = 0.2) +
+  geom_abline(color = "RED") +
+  ggtitle("Lifespan estimates are barely affected by the inclusion of age as a covariate")
+```
+
+## Example Changes
+
+```{r feature_examples, fig.width = 12, fig.height = 15}
+suppressed_theme <- theme(
+  legend.position = "none",
+  strip.background = element_blank(),
+  strip.text.x = element_blank(),
+  plot.title = element_markdown(hjust = 0.5, size = 15),
+  plot.background = element_rect(colour = "gray50", fill=NA, size=0.5)
+  )
+
+sex_ex <- plot_sex(features_with_design, feature_signif, feature_names = "Egfr")$plots$sex + labs(title = "Sex: **Egfr**") + suppressed_theme + theme(axis.title.x = element_blank())
+ddm_ex <- plot_ddm(features_with_design, feature_signif, feature_names = "Hspa4")$plots$ddm + labs(title = "DDM: **Hspa4**") + suppressed_theme + theme(axis.title.x = element_blank())
+aging_ex <- plot_aging(features_with_design, feature_signif, feature_names = "Col3a1")$plots$aging + labs(title = "Chronological age: **Col3a1**") + suppressed_theme
+lifespan_remaining_ex <- plot_lifespan_remaining(features_with_design, feature_signif, feature_names = "Clec3b")$plots$lifespan_remaining + labs(title = "Lifespan remaining: **Clec3b**") + suppressed_theme
+lifespan_ex <- plot_lifespan(features_with_design, feature_signif, feature_names = "Lbp")$plots$lifespan + labs(title = "Lifespan: **Lbp**") + suppressed_theme
+age_x_lifespan_ex <- plot_age_by_lifespan(features_with_design, feature_signif, feature_names = "Igfbp5")$plots$age_by_lifespan + labs(title = "Age x lifespan: **Igfbp5**") + suppressed_theme
+fll_ex <- plot_fraction_of_life_lived(features_with_design, feature_signif, feature_names = "Pcsk9")$plots$fraction_of_life_lived + labs(title = "Fraction of life lived: **Pcsk9**") + theme(
+  strip.background = element_blank(),
+  strip.text.x = element_blank(),
+  plot.background = element_rect(colour = "gray50", fill=NA, size=0.5),
+  plot.title = element_markdown(hjust = 0.5, size = 15)
+  ) +
+  guides(
+    color=guide_legend(override.aes = list(size=5), nrow = 1, direction = "horizontal"),
+    fill="none" 
+    )
+
+combined_example_features <- sex_ex + ddm_ex + aging_ex + lifespan_ex + age_x_lifespan_ex + fll_ex + lifespan_remaining_ex + guide_area() +
+  plot_layout(
+    guides = 'collect',
+    heights = c(2, 3, 3, 0.5),
+    design = c(
+    "
+    AABBCC
+    DDDFFF
+    EEEGGG
+    HHHHHH
+    "
+  ))
+  
+combined_example_features
+create_and_upload_figure(
+  name = "combined_example_features",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3",
+  width = 12,
+  height = 15,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png")
+)
+```
+
+## Dataset Summary
+
+```{r feature_summary}
+feature_signif %>%
+  filter(term == "sex") %>%
+  mutate(is_identified = stringr::str_detect(groupName, "unk")) %>%
+  count(data_modality, is_identified) %>%
+  spread(is_identified, n, fill = 0) %>%
+  dplyr::rename("Data Modality" = data_modality, "# of Unknowns" = `TRUE`, "# of Identified Features" = `FALSE`) %>%
+  knitr::kable() %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+## Functional Enrichments in proteins and lipids
+
+```{r features_for_functional_enrichment}
+feature_names <- feature_signif %>%
+  dplyr::distinct(data_type, groupId, groupName, feature_name)
+
+feature_signif_w_alt_terms <- feature_signif %>%
+  filter(!(term %in% c("lifespan", "early age", "late age", "early age x lifespan", "late age x lifespan"))) %>%
+  dplyr::bind_rows(
+    all_model_signif %>%
+      dplyr::mutate(
+        term = dplyr::case_when(
+          # lifespan w/ and w/o covariates
+          model_name == "cross-sectional lm (age + lifespan), no DDM" & term == "lifespan" ~ "lifespan | age",
+          model_name == "cross-sectional lm (lifespan), no DDM" & term == "lifespan" ~ "lifespan",
+          # age xs vs fc and categorical vs int
+          model_name == "cross-sectional lm (age), no DDM" & term %in% c("early age", "late age") ~ stringr::str_replace(term, "$", " \\(xs\\)"),
+          model_name == "fold-change lm (age), no DDM" & term %in% c("early age", "late age") ~ stringr::str_replace(term, "$", " \\(fc\\)"),
+          model_name == "cross-sectional lm (int-age), no DDM" & term == "age" ~ "age",
+          # age x lifespan xs vs fc and categorical vs int
+          model_name == "cross-sectional lm (age x lifespan), no DDM" & term %in% c("early age x lifespan", "late age x lifespan") ~ stringr::str_replace(term, "$", " \\(xs\\)"),
+          model_name == "fold-change lm (age x lifespan), no DDM" & term %in% c("early age x lifespan", "late age x lifespan") ~ stringr::str_replace(term, "$", " \\(fc\\)"),
+          model_name == "cross-sectional lm (int-age x lifespan), no DDM" & term == "age x lifespan" ~ "age x lifespan",
+          TRUE ~ NA_character_
+        )
+      ) %>%
+      dplyr::filter(!is.na(term)) %>%
+      # feature names were added to feature_signif (prime-time coefs)
+      # but not the alternative models fit covered by all_model_signif 
+      dplyr::left_join(feature_names, by = c("data_type", "groupId"))
+  )
+
+gsea_terms <- feature_signif_w_alt_terms %>%
+  count(term, model_name)
+
+# each term should come from 1 and only 1 model
+
+stopifnot(gsea_terms %>% group_by(term) %>% filter(n() > 1) == 0)
+
+protein_and_lipid_discoveries <- feature_signif_w_alt_terms %>%
+  dplyr::select(data_modality, data_type, groupId, term, q.value) %>%
+  filter(!is.na(q.value)) %>%
+  filter(data_modality %in% c("proteomics", "lipidomics")) %>%
+  filter(dplyr::case_when(
+    term %in% setdiff(gsea_terms$term, c("sex", "ddm")) & q.value < 0.1 ~ TRUE,
+    term %in% c("sex", "ddm") & q.value < 0.001 ~ TRUE, # only look at extremely strong associations for sex & ddm
+    TRUE ~ FALSE
+    )) %>%
+  select(data_modality, data_type, groupId, term) %>%
+  group_by(data_modality, term) %>%
+  filter(n() >= 10) %>%
+  ungroup() %>%
+  nest(hits = -c(term, data_modality))
+```
+
+```{r alt_term_barplot}
+alt_term_signif_counts_overall <- feature_signif_w_alt_terms %>%
+  dplyr::filter(q.value < 0.1) %>%
+  count(term) %>%
+  arrange(desc(n))
+
+alt_terms_signif_counts_by_data_modality <- feature_signif_w_alt_terms %>%
+  dplyr::filter(q.value < 0.1) %>%
+  count(data_modality, term) %>%
+  dplyr::filter(!(term %in% c("late blood draw", "early G8"))) %>%
+  mutate(term = factor(term, levels = alt_term_signif_counts_overall$term))
+
+alt_term_signif_barplot <- ggplot(
+  alt_terms_signif_counts_by_data_modality,
+  aes(x = term, y = n, fill = data_modality)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous("# of significant features") +
+  scale_x_discrete("Regression term", limits = rev) +
+  scale_fill_manual(
+    "Data Modality",
+    values = c("proteomics" = "royalblue1", "metabolomics" = "red3", "lipidomics" = "limegreen"),
+    breaks = c("proteomics", "metabolomics", "lipidomics")
+    ) +
+  coord_flip() +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 15))
+
+alt_term_signif_barplot
+create_and_upload_figure(
+  name = "alt_term_signif_barplot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 6,
+  height = 7,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+  )
+```
+
+### Proteins
+
+#### Convert from UniProt IDs to Entrez
+
+```{r protein_systematic_ids}
+uniprot_2_entrez <- BiocGenerics::toTable(org.Mm.eg.db::org.Mm.egUNIPROT) %>%
+  as_tibble()
+symbol_2_entrez <- BiocGenerics::toTable(org.Mm.eg.db::org.Mm.egSYMBOL) %>%
+  as_tibble()
+
+# we can match with uniprot IDs when overlaying on Reaactome but will match w/ entrez for GSEA
+proteins_w_uniprot <- feature_design_list$proteomics_features %>%
+  # extract uniprot ID
+  tidyr::separate(ProteinId, into = c("tmp", "uniprot_id", "tmp2"), sep = "\\|", remove = FALSE) %>%
+  dplyr::select(-tmp, -tmp2)
+
+proteins_w_entrez <- dplyr::bind_rows(
+  # join by uniprot > entrez
+  proteins_w_uniprot %>%
+    # convert to entrez
+    dplyr::left_join(uniprot_2_entrez, by = "uniprot_id", multiple = "all"),
+  # join by symbols
+  feature_design_list$proteomics_features %>%
+    dplyr::left_join(symbol_2_entrez, by = c("GeneName" = "symbol"),  multiple = "all")
+) %>%
+  # reduce to at most one entrez ID per feature
+  filter(!is.na(gene_id)) %>%
+  arrange(uniprot_id) %>%
+  group_by(data_type, groupId) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+feature_design_list$proteomics_features %>%
+  anti_join(proteins_w_entrez, by = "groupId") %>%
+  sample_n(10) %>%
+  knitr::kable(caption = "132 protein features were not matched to entrez - spot-checking; most are not genes") %>%
+  kableExtra::kable_minimal()
+```
+
+#### Organize Proteins for Enrichment
+
+```{r protein_go}
+# Download mouse gene sets from http://www.gsea-msigdb.org/gsea/downloads.jsp
+gene_set_path <- "/scratch3/sean/msigdb_v2022.1.Mm_files_to_download_locally/msigdb_v2022.1.Mm_GMTs"
+gmts_used <- c(
+  "m2.cp.reactome.v2022.1.Mm.entrez.gmt",
+  "m5.go.bp.v2022.1.Mm.entrez.gmt"
+)
+
+# map from uniprot to entrez
+gmts_list <- file.path(gene_set_path, gmts_used) %>%
+  purrr::map(fgsea::gmtPathways)
+
+gmts_df <- tibble::tibble(gmt = gmts_used, gmt_dat = gmts_list) %>%
+  # cleanup categories of ontologies
+  mutate(category = stringr::str_match(gmt, "^[0-9a-zA-Z]+\\.[0-9a-zA-Z]+\\.([a-zA-Z]+)")[,2]) %>%
+  # convert individual ontologies from a list to a table with a nested character string of members
+  mutate(gmt_df = purrr::map(gmt_dat, ~ tibble(value = names(.), dat = .))) %>%
+  select(-gmt, -gmt_dat) %>%
+  unnest(gmt_df) %>%
+  # tabularize entrez members
+  mutate(members_df = purrr::map(dat, ~ tibble(gene_id = .))) %>%
+  select(-dat) %>%
+  unnest(members_df)
+  
+# reduce GO categories to proteins represented in the plasma proteome
+protein_category_members <- gmts_df %>%
+  inner_join(proteins_w_entrez %>% select(data_type, groupId, gene_id), by = "gene_id", relationship = "many-to-many") %>%
+  group_by(category, value) %>%
+  filter(n() >= 5) %>%
+  ungroup() %>%
+  nest(members = -c(category, value))
+protein_category_sizes <- proteins_w_entrez %>%
+  distinct(data_type, groupId) %>%
+  crossing(gmts_df %>% distinct(category)) %>%
+  nest(analytes = -c(category))
+
+gsea_data <- protein_category_members %>%
+  left_join(protein_category_sizes, by = "category", multiple = "all") %>%
+  crossing(protein_and_lipid_discoveries %>% dplyr::filter(data_modality == "proteomics"))
+```
+
+### Lipids
+
+#### Define Lipid Categories
+
+```{r lipid_categories}
+lipid_feature_attributes <- feature_design_list$small_molecules_features %>%
+  filter(data_type %in% c("lipids-neg", "lipids-pos")) %>%
+  filter(!stringr::str_detect(compoundName, "unk")) %>%
+  distinct(data_type, groupId, compoundName, peak_label) %>%
+  # correct some compounds whose names will be mis-parsed by claman::lipid_components
+  mutate(peak_label = dplyr::case_when(
+    peak_label == "18:1(d7) LPE" ~ "LPE(d18:1)",
+    peak_label == "18:1(d7) LPC" ~ "LPC(d18:1)",
+    peak_label == "15:0-18:1(d7) PE" ~ "PE(15:0/d18:1)",
+    peak_label == "15:0-18:1(d7) PG" ~ "PG(15:0/d18:1)",
+    peak_label == "18:1(d9) SM" ~ "SM(d18:1)",
+    peak_label == "LysoPC(20:2(11Z,14Z))" ~ "LysoPC(20:2)",
+    peak_label == "LysoPC(18:2(9Z,12Z))" ~ "LysoPC(18:2)",
+    peak_label == "LysoPC(20:4(8Z,11Z,14Z,17Z))" ~ "LysoPC(20:4)",
+    peak_label == "LysoPE(0:0/18:1(9Z))" ~ "LysoPE(0:0/18:1)",
+    peak_label == "LysoPE(0:0/18:2(9Z,12Z))" ~ "LysoPE(0:0/18:2)",
+    peak_label == "LysoPE(0:0/20:3(5Z,8Z,11Z))" ~ "LysoPE(0:0/20:3)",
+    peak_label == "LysoPE(18:1(9Z)/0:0)" ~ "LysoPE(18:1/0:0)",
+    peak_label == "LysoPE(20:4(5Z,8Z,11Z,14Z)/0:0)" ~ "LysoPE(20:4/0:0)",
+    peak_label == "PE(16:0/18:2(9Z,12Z))" ~ "PE(16:0/18:2)",
+    peak_label == "PE(16:0/20:3(8Z,11Z,14Z))" ~ "PE(16:0/20:3)",
+    peak_label == "PE(16:0/20:4(5Z,8Z,11Z,14Z))" ~ "PE(16:0/20:4)",
+    peak_label == "PE(P-18:0/22:6(4Z,7Z,10Z,13Z,16Z,19Z))" ~ "PE(p-18:0/22:6)",
+    TRUE ~ peak_label
+    ),
+    peak_label = stringr::str_replace(peak_label, " \\([0-9]\\)$", "")
+    ) %>%
+  dplyr::bind_cols(claman::lipid_components(.$peak_label) %>% dplyr::select(-compoundName)) %>%
+  filter(num_sn_chains != 0)
+
+lipid_categories <- dplyr::bind_rows(
+  # headgroups
+  lipid_feature_attributes %>%
+    dplyr::group_by(lipidClass) %>%
+    dplyr::filter(dplyr::n() >= 5) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(data_type, groupId, value = lipidClass) %>%
+    dplyr::mutate(category = "lipid class"),
+  # distinct tails
+  dplyr::bind_rows(
+    lipid_feature_attributes %>%
+      select(data_type, groupId, value = sn1),
+    lipid_feature_attributes %>%
+      select(data_type, groupId, value = sn2)
+    ) %>%
+    dplyr::distinct(data_type, groupId, value) %>%
+    dplyr::group_by(value) %>%
+    dplyr::filter(dplyr::n() >= 5) %>%
+    dplyr::ungroup() %>%
+    mutate(category = "chains") %>%
+    dplyr::filter(value != "0:0")
+)
+```
+
+#### Organize Lipids for Enrichment
+
+```{r lsea_prep}
+lipid_category_members <- nest(lipid_categories, members = -c(category, value))
+lipid_category_sizes <- lipid_categories %>%
+  distinct(data_type, groupId, category) %>%
+  nest(analytes = -c(category))
+
+lsea_data <- lipid_category_members %>%
+  left_join(lipid_category_sizes, by = "category") %>%
+  crossing(protein_and_lipid_discoveries %>% dplyr::filter(data_modality == "lipidomics"))
+```
+
+### GSEA/LSEA/MSEA
+
+```{r calculate_category_enrichment}
+enrichments_path <- file.path(params$cache_dir, "enrichments.RDS")
+if (file.exists(enrichments_path) && !overwrite) {
+  enrichments <- readRDS(enrichments_path)
+} else {
+  
+  enrichments <- dplyr::bind_rows(gsea_data, lsea_data) %>%
+    mutate(fisher_df = purrr::pmap(list(members, analytes, hits), calculate_category_enrichment)) %>%
+    select(-members, -analytes, -hits) %>%
+    unnest(fisher_df) %>%
+    # separately FDR control each term and data modality
+    nest(term_data = -c(term, data_modality)) %>%
+    mutate(fdr_controlled_term_data = purrr::map(
+      term_data,
+      ~ mutate(., qvalue = p.adjust(p.value, method = "BH"))
+      )) %>%
+    select(-term_data) %>%
+    unnest(fdr_controlled_term_data)
+  
+  saveRDS(enrichments, enrichments_path)
+}
+
+# drop redundant pathways
+
+gsea_hits <- enrichments %>%
+  filter(data_modality == "proteomics", qvalue < 0.1, category_hits >= 3) %>%
+  nest(term_discoveries = -term) %>%
+  # add hits
+  left_join(protein_and_lipid_discoveries %>% filter(data_modality == "proteomics"), by = "term", multiple = "all") %>%
+  # collapse similar categories 
+  mutate(nondegenerate_term_discoveries = purrr::map2(
+    term_discoveries,
+    hits,
+    drop_degenerate_categories,
+    jaccard_cutoff = 0.7
+    )) %>%
+  # unnest
+  dplyr::select(term, nondegenerate_term_discoveries) %>%
+  tidyr::unnest(nondegenerate_term_discoveries) %>%
+  arrange(term, qvalue, p.value)
+
+# add back lipidomics enrichments
+
+gsea_hits <- gsea_hits %>%
+  dplyr::bind_rows(
+    enrichments %>%
+      filter(data_modality == "lipidomics", qvalue < 0.1)
+  )
+```
+
+### Visualize GSEA enrichments
+
+```{r gsea_hit_formatting}
+go_category_members <- dplyr::bind_rows(
+  protein_category_members,
+  lipid_category_members
+  )
+
+# create a color schema for each GO category which can be used for subsequent plots
+
+go_curation <- tibble::tribble(
+  ~ category_value, ~ category_label, ~ category_general_label,
+  "REACTOME_REGULATION_OF_INSULIN_LIKE_GROWTH_FACTOR_IGF_TRANSPORT_AND_UPTAKE_BY_INSULIN_LIKE_GROWTH_FACTOR_BINDING_PROTEINS_IGFBPS", "IGF Signaling", "Signaling",
+  "PC", "Phosphatidylcholine Lipids", "Phosphatidylcholine Lipids",
+  "REACTOME_TOLL_LIKE_RECEPTOR_CASCADES", "Toll-like Receptor Signaling", "Inflammation",
+  "REACTOME_REGULATION_OF_TLR_BY_ENDOGENOUS_LIGAND", "Lipids Regulating TLR Signaling", "Inflammation",
+  "GOBP_ENZYME_LINKED_RECEPTOR_PROTEIN_SIGNALING_PATHWAY", "Enzyme-Linked Signaling", "Signaling",
+  "REACTOME_COLLAGEN_DEGRADATION", "Collagen Degradation", "Extracellular Matrix",
+  "GOBP_EXTERNAL_ENCAPSULATING_STRUCTURE_ORGANIZATION", "External Encapsulating Structure", "Extracellular Matrix",
+  "REACTOME_EXTRACELLULAR_MATRIX_ORGANIZATION", "Extracellular Matrix Organization", "Extracellular Matrix",
+  "REACTOME_ASSEMBLY_OF_COLLAGEN_FIBRILS_AND_OTHER_MULTIMERIC_STRUCTURES", "Collagen Assembly", "Extracellular Matrix",
+  "REACTOME_POST_TRANSLATIONAL_PROTEIN_MODIFICATION", "Post-Translational Modification", "Proteostasis",
+  "GOBP_COLLAGEN_CATABOLIC_PROCESS", "Collagen Catabolism", "Extracellular Matrix",
+  "GOBP_COLLAGEN_METABOLIC_PROCESS", "Collagen Metabolism", "Extracellular Matrix",
+  "GOBP_PROTEOLYSIS", "Proteolysis", "Proteostasis",
+  "GOBP_INFLAMMATORY_RESPONSE", "Inflammation", "Inflammation",
+  "GOBP_RESPONSE_TO_OXYGEN_CONTAINING_COMPOUND", "Response to Compounds with O", "Stress",
+  "GOBP_RESPONSE_TO_NITROGEN_COMPOUND", "Response to Compounds with N", "Stress",
+  "REACTOME_G2_M_CHECKPOINTS", "G2/M Checkpoints", "Other",
+  "REACTOME_ANTIGEN_PROCESSING_UBIQUITINATION_PROTEASOME_DEGRADATION", "Antigen Processing", "Other",
+  "REACTOME_THE_ROLE_OF_GTSE1_IN_G2_M_PROGRESSION_AFTER_G2_CHECKPOINT", "G2/M Progression", "Other",
+  "GOBP_PROTEASOMAL_PROTEIN_CATABOLIC_PROCESS", "Proteosomal Catabolism", "Proteostasis",
+  "REACTOME_METABOLISM_OF_PROTEINS", "Protein Metabolism", "Metabolism",
+  "GOBP_PROTEIN_CATABOLIC_PROCESS", "Protein Catabolism", "Proteostasis",
+  "GOBP_RESPONSE_TO_PEPTIDE", "Response to Peptide", "Signaling",
+  "GOBP_MACROMOLECULE_CATABOLIC_PROCESS", "Macromolecule Catabolism", "Metabolism",
+  "GOBP_PROTEOLYSIS_INVOLVED_IN_PROTEIN_CATABOLIC_PROCESS", "Proteolysis-Driven Protein Catabolism", "Proteostasis",
+  "GOBP_REGULATION_OF_PEPTIDASE_ACTIVITY", "Peptidase Regulation", "Proteostasis",
+  "REACTOME_NON_INTEGRIN_MEMBRANE_ECM_INTERACTIONS", "Non-Integrin Membrane-ECM Interactions", "Extracellular Matrix",
+  "REACTOME_CROSS_PRESENTATION_OF_SOLUBLE_EXOGENOUS_ANTIGENS_ENDOSOMES", "Antigen Presentation", "Other",
+  "REACTOME_GENE_EXPRESSION_TRANSCRIPTION", "Transcription", "Other",
+  "GOBP_NEGATIVE_REGULATION_OF_PROTEIN_METABOLIC_PROCESS", "Enzyme downregulation", "Metabolism",
+  "GOBP_NEGATIVE_REGULATION_OF_PEPTIDASE_ACTIVITY", "Peptidase Inhibition", "Proteostasis",
+  "GOBP_RESPONSE_TO_HORMONE", "Response to Hormones", "Signaling",
+  "GOBP_NEGATIVE_REGULATION_OF_PROTEOLYSIS", "Proteolysis Inhibition", "Proteostasis",
+  "PE", "Phosphatidylethanolamine Lipids", "Chronological Aging Lipids",
+  "SM", "Sphingomylin Lipids", "Chronological Aging Lipids",
+  "LPI", "Lysophosphatidylinositol Lipids", "Chronological Aging Lipids",
+  "22:6", "Lipids with 22:6", "Chronological Aging Lipids",
+  "20:3", "Lipids with 20:3", "Other",
+  "17:0", "Lipids with 17:0", "Lipids with 17:0 (lifespan-associated)",
+  "p-16:0", "Lipids with p-16:0", "Chronological Aging Lipids",
+  "FA", "Fatty Acids", "Chronological Aging Lipids",
+  "GOBP_ENTRY_INTO_HOST", "Entry Into Host", "Inflammation",
+  "GOBP_MOVEMENT_IN_HOST", "Movement in Host", "Inflammation",
+  "24:1", "Lipids with 24:1", "Lipids with 24:1 (FLL-associated)",
+  "REACTOME_TERMINAL_PATHWAY_OF_COMPLEMENT", "Terminal Pathway of Complement", "Other",
+  "GOBP_REGULATION_OF_PROTEOLYSIS", "Proteolysis Regulation", "Proteostasis",
+  "GOBP_POSITIVE_REGULATION_OF_RESPONSE_TO_EXTERNAL_STIMULUS", "Response to External Stimuli", "Signaling",
+  "GOBP_CELLULAR_RESPONSE_TO_OXIDATIVE_STRESS", "Response to Oxidative Stress", "Stress",
+  "GOBP_RESPONSE_TO_ABIOTIC_STIMULUS", "Response to Abiotic Stimuli", "Stress",
+  "GOBP_CELLULAR_OXIDANT_DETOXIFICATION", "Oxidant Detoxification", "Metabolism",
+  "GOBP_RESPONSE_TO_HYDROGEN_PEROXIDE", "Response to H2O2", "Stress",
+  "GOBP_CELLULAR_RESPONSE_TO_OXYGEN_CONTAINING_COMPOUND", "Cellular Response to Compounds with O", "Stress",
+  "GOBP_RESPONSE_TO_RADIATION", "Response to Radiation", "Stress",
+  "GOBP_HYDROGEN_PEROXIDE_METABOLIC_PROCESS", "H2O2 Metabolism", "Metabolism",
+  "REACTOME_DETOXIFICATION_OF_REACTIVE_OXYGEN_SPECIES", "Detoxification of ROS", "Metabolism",
+  "GOBP_POSITIVE_REGULATION_OF_SIGNALING", "Positive Regulation of Signaling", "Signaling",
+  "GOBP_MUSCLE_TISSUE_DEVELOPMENT", "Muscle Development", "Other",
+  "GOBP_POSITIVE_REGULATION_OF_CYTOSOLIC_CALCIUM_ION_CONCENTRATION", "Regulation of Ca Concentration", "Other",
+  "GOBP_RESPONSE_TO_INORGANIC_SUBSTANCE", "Response to Inorganic Substance", "Other",
+  "GOBP_CELLULAR_RESPONSE_TO_OXYGEN_RADICAL", "Response to O Radical", "Stress",
+  "GOBP_STEM_CELL_PROLIFERATION", "Stem Cell Proliferation", "Other",
+  "GOBP_POSITIVE_REGULATION_OF_PROTEIN_METABOLIC_PROCESS", "Positive Regulation of Protein Metabolism", "Metabolism",
+  "GOBP_RESPONSE_TO_DECREASED_OXYGEN_LEVELS", "Response to Hypoxia", "Stress",
+  "GOBP_SENSORY_PERCEPTION_OF_PAIN", "Pain Perception", "Signaling",
+  "REACTOME_SYNDECAN_INTERACTIONS", "Syndecan Interactions", "Extracellular Matrix",
+  "REACTOME_INTRACELLULAR_SIGNALING_BY_SECOND_MESSENGERS", "Signaling by Second Messengers", "Signaling",
+  "GOBP_HEAD_DEVELOPMENT", "Head Development", "Other",
+  "REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES", "Amino Acid Metabolism", "Metabolism",
+  "GOBP_HEART_DEVELOPMENT", "Heart Development", "Other",
+  "GOBP_SUBSTRATE_DEPENDENT_CELL_MIGRATION", "Substrate-Dependent Cell Migration", "Other"
+) %>%
+  left_join(go_category_members, by = c("category_value" = "value"))
+
+stopifnot(nrow(go_curation %>% count(category_label) %>% filter(n > 1)) == 0)
+
+go_colorscheme <- tibble::tribble(
+  ~ category_general_label, ~ category_color,
+  "Signaling", "darkblue",
+  "Metabolism", "lightslateblue",
+  "Stress", "darkorchid1",
+  "Inflammation", "steelblue1",
+  "Extracellular Matrix", "turquoise1",
+  "Proteostasis", "orchid1",
+  "Phosphatidylcholine Lipids", "springgreen",
+  "Lipids with 17:0 (lifespan-associated)", "olivedrab3",
+  "Lipids with 24:1 (FLL-associated)", "darkseagreen",
+  "Chronological Aging Lipids", "forestgreen"
+) %>%
+  mutate(category_color_hex = gplots::col2hex(category_color))
+
+go_hit_colorscheme <- go_curation %>%
+  dplyr::left_join(go_colorscheme, by = "category_general_label")
+
+# print colors > hex for color-matching in illustrator
+go_colorscheme %>%
+  knitr::kable() %>%
+  kableExtra::kable_classic()
+```
+
+
+```{r beeswarm_prep}
+term_labels_extended <- gsea_hits %>%
+  count(term) %>%
+  add_term_labels()
+  
+gsea_category_plot_df <- gsea_hits %>%
+  # drop degenerate GO categories
+  filter(is.na(distinct_term) | distinct_term == TRUE) %>%
+  # top 2 for each term x category
+  group_by(term, data_modality) %>%
+  arrange(qvalue) %>%
+  mutate(group_order = 1:n()) %>%
+  ungroup() %>%
+  arrange(term, qvalue) %>%
+  # create a unique label for each GO x term combination to plot
+  unite(term_go_pair, term, data_modality, category, value, remove = FALSE) %>%
+  left_join(go_hit_colorscheme %>% distinct(category_value, category_label, category_general_label, category_color_hex), by = c("value" = "category_value")) %>%
+  # add category members
+  left_join(go_category_members, by = c("category", "value")) %>%
+  mutate(signifstar = dplyr::case_when(
+    qvalue < 0.001 ~ "***",
+    qvalue < 0.01 ~ "**",
+    qvalue < 0.1 ~ "*",
+    TRUE ~ "n.s."
+  )) %>%
+  mutate(
+    term_go_pair = factor(term_go_pair, levels = term_go_pair),
+    # overwrite category label if one was not provided from go_hit_colorscheme
+    category_label = ifelse(!is.na(category_label), category_label, stringr::str_trunc(value, 40)),
+    ) %>%
+  unite(category_label_w_star, category_label, signifstar, sep = " ", remove = FALSE) %>%
+  mutate(
+    category_color_hex = ifelse(!is.na(category_color_hex), category_color_hex, gplots::col2hex("gray20")),
+    category_label_w_star_md = glue::glue("<span style='color:{category_color_hex}'><b>{category_label_w_star}</b></span>")
+  ) %>%
+  select(term_go_pair, category_label, category_general_label, category_label_w_star_md, term, group_order, data_modality, go_value = value, members)
+  
+gsea_category_members_df <- gsea_category_plot_df %>%
+  unnest(members) %>%
+  left_join(
+    feature_signif_w_alt_terms,
+    by = c("term", "data_modality", "data_type", "groupId"),
+    multiple = "all"
+    ) %>%
+  mutate(
+  scaled_effect_size = dplyr::case_when(
+      term %in% c("lifespan", "lifespan remaining", "late age x lifespan", "late age x lifespan (fc)", "late age x lifespan (xs)", "lifespan | age", "age") ~ estimate * 100,
+      TRUE ~ estimate
+    )) %>%
+  left_join(term_labels_extended, by = "term") %>%
+  mutate(is_signif = ifelse(q.value < 0.1, "q < 0.1", "n.s."))
+```
+
+
+```{r beeswarm_major_effects, fig.height = 9, fig.width = 11}
+gsea_category_plot_df_subset <- gsea_category_members_df %>%
+  filter(term_label %in% c("DDM", "Early Age (Fc)", "Late Age (Fc)", "Sex", "Fraction Of\nLife Lived", "Lifespan | Age", "Late Age X\nLifespan (Fc)", "Lifespan\nRemaining")) %>%
+  mutate(term_label_simple = factor(term_label_simple, levels = c("DDM", "Sex", "Early Age", "Late Age", "Fraction Of\nLife Lived", "Late Age X\nLifespan", "Lifespan\nRemaining", "Lifespan"))) %>%
+  arrange(term_go_pair) %>%
+  filter(case_when(
+    term_label == "DDM" & group_order >= 5 ~ FALSE,
+    TRUE ~ TRUE
+    ))
+
+fxnl_enrichments_beeswarm_by_day <- gsea_category_plot_df_subset %>%
+  filter(term %in% c("lifespan | age", "lifespan remaining", "late age x lifespan (fc)")) %>%
+  plot_fxnl_enrichment_beeswarm(scale_for_per_day_effect_sizes = TRUE)
+
+fxnl_enrichments_beeswarm_not_by_day <- gsea_category_plot_df_subset %>%
+  filter(!(term %in% c("lifespan | age", "lifespan remaining", "late age x lifespan (fc)"))) %>%
+  plot_fxnl_enrichment_beeswarm(scale_for_per_day_effect_sizes = FALSE)
+
+fxnl_enrichments_beeswarm <- fxnl_enrichments_beeswarm_not_by_day +
+  fxnl_enrichments_beeswarm_by_day +
+  guide_area() +
+  plot_layout(
+    guides = 'collect',
+    heights = c(3, 0.02),
+    design = c(
+    "
+    AB
+    CB
+    "
+  ))
+  
+fxnl_enrichments_beeswarm
+create_and_upload_figure(
+  name = "fxnl_enrichments_beeswarm",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3",
+  width = 11,
+  height = 9,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+```{r beeswarm_alt_terms, fig.height = 9, fig.width = 11}
+gsea_category_plot_df_subset <- gsea_category_members_df %>%
+  filter(term_label_simple %in% c("Early Age", "Late Age", "Age", "Lifespan", "Late Blood Draw")) %>%
+  mutate(term_label_simple = factor(term_label_simple, levels = c("Early Age", "Late Age", "Age", "Lifespan", "Late Blood Draw"))) %>%
+  arrange(term_go_pair)
+
+alt_terms_beeswarm_by_day <- gsea_category_plot_df_subset %>%
+  filter(term %in% c("age", "lifespan", "lifespan | age")) %>%
+  plot_fxnl_enrichment_beeswarm(
+    scale_for_per_day_effect_sizes = TRUE,
+    facet_formula = as.formula(term_label_simple + term_label ~ .)
+    )
+
+alt_terms_beeswarm_not_by_day <- gsea_category_plot_df_subset %>%
+  filter(!(term %in% c("age", "lifespan", "lifespan | age", "late blood draw"))) %>%
+  plot_fxnl_enrichment_beeswarm(
+    scale_for_per_day_effect_sizes = FALSE,
+    facet_formula = as.formula(term_label_simple + term_label ~ .)
+    )
+
+alt_terms_beeswarm_not_ldb <- gsea_category_plot_df_subset %>%
+  filter(term %in% c("late blood draw")) %>%
+  plot_fxnl_enrichment_beeswarm()
+
+# fll x male effects' categories seem quite random
+#alt_terms_beeswarm_not_fll_by_sex <- gsea_category_plot_df_subset %>%
+#  filter(term %in% c("fraction of life lived x male")) %>%
+#  plot_fxnl_enrichment_beeswarm()
+
+alt_terms_beeswarm <- alt_terms_beeswarm_by_day +
+  alt_terms_beeswarm_not_ldb +
+  alt_terms_beeswarm_not_by_day +
+  guide_area() +
+  plot_layout(
+    guides = 'collect',
+    heights = c(3, 1, 0.02),
+    design = c(
+    "
+    AC
+    BC
+    DC
+    "
+  ))
+
+alt_terms_beeswarm
+create_and_upload_figure(
+  name = "fxnl_enrichments_alt_beeswarm",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 11,
+  height = 9,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Export Results
+
+```{r create_feature_signif_aug}
+# annotate features and threshold effect sizes
+feature_signif_aug <- feature_signif_w_alt_terms %>%
+  mutate(
+    is_discovery = case_when(
+      q.value < 0.1 ~ "q < 0.1",
+      is.na(q.value) & pvalue_bs < 0.0001 ~ "p < 1e-4 unknown",
+      .default = "n.s."
+    ),
+    nlog10_pvalue = -1*log10(pvalue_bs),
+    scaled_effect_size = dplyr::case_when(
+      term %in% c("lifespan", "lifespan remaining", "late age x lifespan") ~ estimate * 100,
+      TRUE ~ estimate
+    ),
+    scaled_effect_size_thresh = dplyr::case_when(
+      is_discovery == "n.s." ~ 0,
+      term %in% c("lifespan", "lifespan remaining", "late age x lifespan") ~ pmin(0.1, pmax(-0.1, scaled_effect_size)),
+      term %in% c("late age", "early age") ~ pmin(0.5, pmax(-0.5, scaled_effect_size)),
+      TRUE ~ pmin(1, pmax(-1, scaled_effect_size))
+    )) %>%
+  # add term labels to same categories from beeswarm (all terms associated with 1+ pathways)
+  inner_join(term_labels_extended, by = "term")
+
+# format pathway enrichments with gene-level membership
+annotated_gsea_membership <- gsea_hits %>%
+  filter(is.na(distinct_term) | distinct_term == TRUE) %>%
+  select(term:value, category_qvalue = qvalue, category_hits_df) %>%
+  tidyr::unnest(category_hits_df) %>%
+  left_join(
+    feature_signif_aug %>% select(term, data_modality, groupId, feature_name, scaled_effect_size, feature_qvalue = q.value),
+    by = c("term", "data_modality", "groupId")
+    )
+
+stopifnot(nrow(annotated_gsea_membership %>% filter(is.na(feature_qvalue))) == 0)
+```
+
+```{r export}
+figure_3_out <- list(
+  "go_hit_colorscheme" = go_hit_colorscheme,
+  "feature_signif_aug" = feature_signif_aug,
+  "feature_signif_w_alt_terms" = feature_signif_w_alt_terms,
+  "annotated_gsea_membership" = annotated_gsea_membership,
+  "gsea_hits" = gsea_hits,
+  "go_category_members" = go_category_members,
+  "gsea_category_members_df" = gsea_category_members_df
+)
+
+saveRDS(figure_3_out, file = file.path(params$cache_dir, "figure_3_out.RDS"))
+```
+
+### Supplemental Tables
+
+```{r reactome_formatting}
+if (params$update_figures) {
+  
+  # abundances - features, samples, and measurements tables will be combined in a table
+  features_out <- features %>%
+    dplyr::select(-is_unknown, -groupId) %>%
+    relocate(feature_name)
+  
+  samples_out <- samples %>%
+    dplyr::select(
+      unique_sample_id, set, sample, Mouse.ID, blood_draw_age_actual,
+      Age, Generation, Sex, Birth_date, lifespan, lifespan_remaining,
+      fraction_of_life_lived, is_ddm_sample, Draw_date,
+      xs_batch, fc_batch
+      ) %>%
+    arrange(unique_sample_id)
+  
+  measurements_out <- romic::get_tomic_table(tidy_omics, "measurements") %>%
+    semi_join(features, by = "feature_name") %>%
+    dplyr::select(-dataset, -weight, -initial_abundance, -corrected_initial_abundance) %>%
+    relocate(feature_name, unique_sample_id, unique_batch)
+  
+  readme <- tibble::tribble(
+    ~ "table", ~ "variable", ~ "description",
+    "features", "feature_name", "A unique name for the measured molecule",
+    "features", "data_modality", "proteomics, metabolomics, or lipidomics",
+    "features", "data_type", "A subtype of data modality",
+    "features", "gene", "A gene symbol for proteins (when possible)",
+    "features", "cluster", "K-means clustering cluster assignment with K = 20",
+    "features", "feature_label", "A simpler but not necessarily unique feature label",
+    "samples", "unique_sample_id", "A unique non-biological identifier for a sample",
+    "samples", "set", "The tranche of the dataset when the sample was profiled",
+    "samples", "sample", "A non-biological identifier for a distinct sample within a set",
+    "samples", "Mouse.ID", "A unique identifier for each DO mouse",
+    "samples", "blood_draw_age_actual", "Chronological age (days since birth)",
+    "samples", "Age", "Approximate age: {8, 14, 20 months}",
+    "samples", "Generation", "DO breeding generation",
+    "samples", "Sex", "Male (M) or female (F)",
+    "samples", "Birth_date", "Date of birth (YYYY-MM-DD)",
+    "samples", "lifespan", "Lifespan (Date of death - Birth_date)",
+    "samples", "lifespan_remaining", "Lifespan remaining (Date of death - Draw_date)",
+    "samples", "fraction_of_life_lived", "Fraction of life lived (FLL; blood_draw_age_actual / lifespan)",
+    "samples", "is_ddm_sample", "Is DDM sample? TRUE if lifespan remaining < 21 days",
+    "samples", "Draw_date", "Date of blood draw (YYYY-MM-DD)",
+    "samples", "xs_batch", "Batch covariate when fitting a cross-sectional model",
+    "samples", "fc_batch", "Batch covariate when fitting a fold-change model (this differs from xs_batch because early G8 samples serving as the reference actually creates a batch effect in the unaffected G8 samples)",
+    "measurements", "feature_name", "Unique molecule matching entries in the features table",
+    "measurements", "unique_sample_id", "Unique sample matching entries in the samples table",
+    "measurements", "unique_batch", "Batch when sample was run in each data type (which may differ somewhat due to re-runs)",
+    "measurements", "normalized_log2_abundance", "log2 relative abundances (centered by feature)",
+    "measurements", "log2_fold_change", "log2 fold-change relative to 8 month blood draw",
+    "measurements", "corrected_log2_abundance", "log2 relative abundances (centered by feature), corrected for xs_batch",
+    "measurements", "corrected_log2_fold_change", "log2 fold-change relative to 8 month blood draw, corrected for fc_batch" 
+  )
+  
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, "README")
+  openxlsx::writeData(wb, "README", readme)
+  openxlsx::addWorksheet(wb, "features")
+  openxlsx::writeData(wb, "features", features_out)
+  openxlsx::addWorksheet(wb, "samples")
+  openxlsx::writeData(wb, "samples", samples_out)
+  openxlsx::addWorksheet(wb, "measurements")
+  openxlsx::writeData(wb, "measurements", measurements_out)
+  
+  abundances_path = file.path(params$figures_dir, "ST1_abundances.xlsx")
+  openxlsx::saveWorkbook(wb, file = abundances_path, overwrite = TRUE)
+  
+  # differential abundances
+  diff_abundance_local_path <- file.path(params$figures_dir, "ST3_diff_abundances.tsv")
+  feature_signif %>%
+    select(data_modality, data_type, feature_name, model_name, term, estimate, statistic, pvalue_ols, pvalue_bs, q.value) %>%
+    readr::write_tsv(file = diff_abundance_local_path)
+  
+  # diffex including alternative model formulations
+  diff_abundances_extended_local_path <- file.path(params$figures_dir, "ST4_diff_abundance_extended.tsv")
+  feature_signif_w_alt_terms %>%
+    select(data_modality, data_type, feature_name, model_name, term, estimate, statistic, pvalue_ols, pvalue_bs, q.value) %>%
+    readr::write_tsv(file = diff_abundances_extended_local_path)
+  
+  # go categories
+  
+  readme <- tibble::tribble(
+    ~ "table", ~ "variable", ~ "description",
+    "pathways", "category_general_label", "High-level summary of pathway",
+    "pathways", "category_label", "Simplified unique version of category_value",
+    "pathways", "category", "Type of functional enrichment",
+    "pathways", "category_value", "GO category name from MSigDB, or lipid attribute",
+    "enrichments", "term", "regression terms (matching results from Table ST4)",
+    "enrichments", "category_general_label", "High-level summary of pathway ('NA' for unpresented associations)",
+    "enrichments", "category_label", "Simplified unique version of category_value (or GO category name for unpresented associations)",
+    "enrichments", "estimate", "Fisher Exact test effect size for overrepresentation",
+    "enrichments", "p.value", "p-value for Fisher Exact test",
+    "enrichments", "category_hits", "Number of category members changing for term",
+    "enrichments", "category_size", "Category members measured in dataset",
+    "enrichments", "qvalue", "Benjamini-Hochberg FDR-controlled p.value",
+    "enrichments", "distinct_term", "if FALSE then pathway membership overlaps with another pathway with stronger changes",
+    "members", "term", "regression terms (matching results from Table ST4)",
+    "members", "category_general_label", "High-level summary of pathway for pathways where distinct_term is TRUE",
+    "members", "category_label", "Simplified unique version of category_value for pathways where distinct_term is TRUE",
+    "members", "feature_name", "Pathway member corresponding to names in Table ST1",
+    "members", "scaled_effect_size", "Regression effect size (scaled by 100x for terms in units of days)",
+    "members", "feature_qvalue", "Storey qvalue FDR controlled association of feature_name for term"
+    )
+    
+  pathway_enrichment_metadata <- go_hit_colorscheme %>%
+    semi_join(gsea_hits, by = c("category_value" = "value")) %>%
+    mutate(is_lipid = stringr::str_detect(category_general_label, "Lipids")) %>%
+    arrange(is_lipid, category_general_label, category_label) %>%
+    select(category_general_label, category_label, category, category_value) %>%
+    mutate(category_label = factor(category_label, levels = category_label))
+  stopifnot(!any(duplicated(pathway_enrichment_metadata$category_label)))
+  
+  # category enrichments
+  pathway_enrichment_enrichments <- gsea_hits %>%
+    left_join(
+      pathway_enrichment_metadata,
+      by = c("category" = "category", "value" = "category_value")
+      ) %>%
+    relocate(term, category_general_label, category_label) %>%
+    arrange(term, category_general_label, category_label) %>%
+    mutate(category_label = ifelse(is.na(category_label), value, as.character(category_label))) %>%
+    select(-category_hits_df, -category, -value, -data_modality, -conf.low)
+  
+  pathway_enrichment_members <- annotated_gsea_membership %>%
+    left_join(
+      pathway_enrichment_metadata,
+      by = c("category" = "category", "value" = "category_value")
+      ) %>%
+    relocate(term, category_general_label, category_label) %>%
+    arrange(term, category_general_label, category_label) %>%
+    select(term:category_label, feature_name, scaled_effect_size, feature_qvalue)
+  
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, "README")
+  openxlsx::writeData(wb, "README", readme)
+  openxlsx::addWorksheet(wb, "pathways")
+  openxlsx::writeData(wb, "pathways", pathway_enrichment_metadata)
+  openxlsx::addWorksheet(wb, "enrichments")
+  openxlsx::writeData(wb, "enrichments", pathway_enrichment_enrichments)
+  openxlsx::addWorksheet(wb, "members")
+  openxlsx::writeData(wb, "members", pathway_enrichment_members)
+  
+  functional_enrichments_path = file.path(params$figures_dir, "ST5_functional_enrichments.xlsx")
+  openxlsx::saveWorkbook(wb, file = functional_enrichments_path, overwrite = TRUE)
+  
+  # upload to gDrive
+  
+  c(
+    abundances_path, # ST1
+    diff_abundance_local_path, # ST3
+    diff_abundances_extended_local_path, # ST4
+    functional_enrichments_path # ST5
+    ) %>%
+    purrr::walk(
+      calibase::upload_to_drive,
+      drive_path = "Tables",
+      drive_root = params$manuscript_drive_root
+      )
+  
+  # format thresholded effect sizes as a table for overlaying on Reactome pathways
+  
+  effect_nest <- feature_signif_aug %>%
+    inner_join(proteins_w_entrez, by = c("data_type", "groupId")) %>%
+    dplyr::select(gene_id, term, scaled_effect_size_thresh) %>%
+    # Reactome does poor job matching with UniProt IDs
+    #inner_join(proteins_w_uniprot, by = c("data_type", "groupId")) %>%
+    #dplyr::select(uniprot_id, term, scaled_effect_size_thresh) %>%
+    tidyr::nest(term_effect_sizes_df = -term) %>%
+    dplyr::mutate(
+      term = stringr::str_replace_all(term, " ", "_"),
+      term_tmp_file = file.path(params$figures_dir, glue::glue("{term}_effect.tsv"))
+      )
+    
+  purrr::walk2(effect_nest$term_effect_sizes_df, effect_nest$term_tmp_file, readr::write_tsv)
+  purrr::walk(effect_nest$term_tmp_file, calibase::upload_to_drive, drive_path = "Tables/terms_to_entrez", drive_root = params$manuscript_drive_root)
+}
+```
+

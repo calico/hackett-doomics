@@ -1,0 +1,298 @@
+---
+title: "Figure 1: Study Design and Informatics"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+
+# other figure-specific configuration
+
+# drive ID for manuscript figures and other assets
+manuscript_drive_root <- googledrive::as_id(params$manuscript_drive_root)
+
+# load SHOCK results from Drive
+# its unclear whether and how much of this data we can release so
+# we need to make it very explicit when we load these results
+source(file.path(params$repo_path, "utils", "data_prep.R"))
+mouse_phenotypes <- load_mouse_phenotypes(shock_token = params$shock_token)
+```
+
+# Figure 1
+
+## Histogram of all shock lifespans and mice selected in this study
+
+```{r lifespan_hist, fig.height = 4, fig.width = 8}
+this_study_do_ids <- tidy_omics$data  %>%
+  distinct(Mouse.ID) %>%
+  mutate(this_study = TRUE)
+
+annotated_shock_mice <- mouse_phenotypes$mouse_level_phenotypes %>%
+  left_join(this_study_do_ids, by = "Mouse.ID") %>%
+  replace_na(list(this_study = FALSE))
+
+stopifnot(sum(annotated_shock_mice$this_study) == 110)
+
+month_labels <- tibble::tribble(
+  ~ x, ~ y, ~ label,
+  230, 25, "8 months",
+  410, 25, "14 months",
+  595, 25, "20 months"
+  )
+
+# lifespans - https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2768517/
+# founder strains - https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4683640/
+founder_strains <- tibble::tribble(
+  ~ "strain", ~ "male",  ~"female",
+  "CAST/EiJ", 567, NA_real_,
+  "NZO/H1LtJ", 576, 423,
+  "A/J", 669, 623,
+  "NOD.B10-H2b*", 662, 653,
+  "PWD/PhJ*", 866, 813,
+  "129S1/SvImJ", 819, 882,
+  "C57BL/6J", 866, 901,
+  "WSB/EiJ", 964, 871
+) %>%
+  rowwise() %>%
+  mutate(avg_lifespan = mean(c(male, female), na.rm = TRUE))
+
+hackett_median_lifespan <- annotated_shock_mice %>%
+  filter(this_study) %>%
+  {median(.$lifespan)}
+
+shock_median_lifespan <- annotated_shock_mice %>%
+  {median(.$lifespan, na.rm = TRUE)}
+
+mouse_median_lifespans <- bind_rows(
+  founder_strains %>% mutate(category = "founders" ),
+  tibble::tribble(
+    ~ strain, ~ avg_lifespan, ~ category,
+    "Selected DO", hackett_median_lifespan, "selected", 
+    "SHOCK DO", shock_median_lifespan, "shock"
+  )
+) %>%
+  mutate(plot_type = "header")
+
+
+lifespan_distribution <- ggplot(annotated_shock_mice %>% mutate(plot_type = "hist"), aes(x = lifespan)) +
+  geom_histogram(binwidth = 20, aes(fill = this_study)) +
+  geom_vline(aes(plot_type ="hist"), xintercept = c(365 * 8/12, 365 * 14/12, 365 * 20/12)-20, linetype="dotted") +
+  geom_text(data = month_labels %>% mutate(plot_type = "hist"), aes(x = x, y = y, label = label), hjust = 0) +
+  geom_vline(data = mouse_median_lifespans, aes(xintercept = avg_lifespan, color = category)) +
+  #ggrepel::geom_text_repel(data = mouse_median_lifespans, aes(x = avg_lifespan, label = strain, color = category), y = 1, hjust = 1, size = 3, min.segment.length = 0) +
+  geom_text(data = mouse_median_lifespans, aes(x = avg_lifespan, label = strain, color = category), y = 0.5, hjust = 1, size = 4, angle = -60) +
+  facet_grid(plot_type ~ ., scale = "free_y", space = "free_y") +
+  scale_x_continuous("Lifespan (days)", expand = c(0,0), breaks = seq(0, 1600, by = 100)) +
+  scale_y_continuous("Number of mice", expand = c(0,0)) +
+  scale_fill_manual(NULL, breaks = c("TRUE", "FALSE"), labels = c("Selected for multi-omics", "No multi-omics"), values = c("TRUE" = "#5BB867", "FALSE" = "gray55")) +
+  scale_color_manual(NULL, values = c("founders" = "gray10", "selected" = "#5BB867", "shock" = "gray55")) +
+  expand_limits(x = 0, y = c(0, 5)) +
+  theme_bw() + theme(legend.position = "bottom") +
+  guides(color = FALSE) 
+
+lifespan_distribution
+create_and_upload_figure(
+  name = "lifespan_distribution",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure1",
+  width = 8,
+  height = 5,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+# Informatics
+
+## Injection Correlation
+
+Injection comparison plots were created in featurization_small_molecules.Rmd for all datasets with multiple replicates. There are four such datasets, positive and negative mode metabolomics and lipidomics for set12 (while no technical replicates were used in set3).
+
+```{r injection_comparison}
+path_do_config <- file.path(params$repo_path, "do_config.json")
+path_out_base_dir <- file.path(load_domics("informatics", domics_paths), "metabolites_lipids")
+featurization_parameters <- suppressMessages(featurization_parameterization(path_do_config, path_out_base_dir))
+
+# copy all of the relevant plots to a common location so the .pngs can be merged in Adobe InDesign
+
+injection_plots_df <- featurization_parameters %>%
+  filter(set == "1/2", data_type %in% c("metabolites-neg", "metabolites-pos")) %>%
+  mutate(
+    plot_path = file.path(dataset_path, "out_figures", "injection_comparison-1.png"),
+    exists = file.exists(plot_path),
+    updated_name = glue::glue("{data_type}_injection_comparison.png"),
+    updated_path = file.path(params$figures_dir, updated_name)
+    ) 
+
+# move and rename figures
+purrr::walk2(
+  injection_plots_df$plot_path,
+  injection_plots_df$updated_path,
+  file.copy
+)
+
+purrr::walk(
+  injection_plots_df$updated_path,
+  calibase::upload_to_drive,
+  drive_path = "Plots/injection_comparison",
+  drive_root = manuscript_drive_root
+)
+```
+
+## Compare All Normalization Methods
+
+```{r sample_v_posctl_rmse, fig.height = 6, fig.width = 6}
+all_normalized_peaks <- featurization_parameters %>%
+  mutate(
+    peaks_path = file.path(dataset_path, "out_files", "normalized_small_molecules.Rds"),
+    peaks_dat = purrr::map(peaks_path, readRDS)
+    ) %>%
+  mutate(
+    posctrl_measurements = purrr::map(
+      peaks_dat,
+      ~ romic::filter_tomic(., "category", "samples", "posctl",  "sample_type") %>%
+        {.$measurements}
+    ),
+    sample_measurements = purrr::map(
+      peaks_dat,
+      ~ romic::filter_tomic(., "category", "samples", "sample",  "sample_type") %>%
+        {.$measurements}
+    ))
+
+sample_summaries <- dplyr::bind_rows(
+    all_normalized_peaks %>%
+      select(data_partition, method, set, posctrl_measurements) %>%
+      unnest(posctrl_measurements) %>%
+      gather(processing, log2_abundance, -data_partition, -method, -set, -groupId, -sampleId) %>%
+      mutate(sample_type = "posctl"),
+    all_normalized_peaks %>%
+      select(data_partition, method, set, sample_measurements) %>%
+      unnest(sample_measurements) %>%
+      tidyr::gather(processing, log2_abundance, -data_partition, -method, -set, -groupId, -sampleId) %>%
+      mutate(sample_type = "sample")
+  ) %>%
+  dplyr::filter(log2_abundance > 12 + 0.001) %>%
+  dplyr::group_by(data_partition, set, sample_type, processing, groupId) %>%
+  dplyr::filter(n() > 2) %>%
+  dplyr::summarize(
+    posctl_mean = mean(log2_abundance),
+    posctl_sd = sd(log2_abundance),
+    .groups = "drop"
+    ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!(processing %in% c(".loess_fit", "normalized_log2_abundance")))
+
+processing_metadata <- sample_summaries %>%
+  distinct(processing) %>%
+  mutate(
+    column_normalization = ifelse(stringr::str_detect(processing, "^loading"), "Yes", "No"),
+    batch_control = dplyr::case_when(
+      stringr::str_detect(processing, "b_centered") ~ "Center batches",
+      stringr::str_detect(processing, "b_reference") ~ "Center each batch's\npositive controls",
+      stringr::str_detect(processing, "loess") ~ "LOESS fit through time",
+      TRUE ~ "None"
+    ))
+
+data_partition_metadata <- sample_summaries %>%
+  distinct(data_partition) %>%
+  mutate(
+    data_type = stringr::str_replace(data_partition, "\\-[0-9]+$", ""),
+    data_type = stringr::str_replace(data_type, "-pos", " (+)"),
+    data_type = stringr::str_replace(data_type, "-neg", " (-)"),
+    data_modality = ifelse(stringr::str_detect(data_type, "lipids"), "lipids", "metabolites"),
+    Mode = ifelse(stringr::str_detect(data_type, "-"), "negative", "positive")
+    )
+
+rmse_by_partition <-sample_summaries %>%
+  dplyr::group_by(sample_type, set, data_partition, processing) %>%
+  dplyr::summarize(RMSE = sqrt(sum(posctl_sd^2)/n()), .groups = "drop") %>%
+  spread(sample_type, RMSE) %>%
+  left_join(processing_metadata, by = "processing") %>%
+  left_join(data_partition_metadata, by = "data_partition")
+
+rmse_by_set <- sample_summaries %>%
+  left_join(data_partition_metadata, by = "data_partition") %>%
+  dplyr::group_by(sample_type, set, data_modality, processing) %>%
+  dplyr::summarize(RMSE = sqrt(sum(posctl_sd^2)/n()), .groups = "drop") %>%
+  spread(sample_type, RMSE) %>%
+  left_join(processing_metadata, by = "processing") %>%
+  mutate(data_type = "All")
+
+normalization_choice_plot <- rmse_by_partition %>%
+  mutate(
+    set = glue::glue("Set {set}"),
+    data_modality = stringr::str_to_title(data_modality)
+    ) %>%
+  ggplot(aes(x = sample, y = posctl, color = batch_control, shape = Mode, alpha = column_normalization)) +
+  geom_point(size = 6, shape = "O") +
+  geom_point(size = 6) +
+  facet_grid(data_modality ~ set) +
+  scale_x_continuous("Sample RMSE") +
+  scale_y_continuous("Positive Control RMSE") +
+  scale_shape_manual(values = c("negative" = "-", "positive" = "+")) +
+  scale_color_manual(
+    "Batch Normalization\nMethod",
+    values = wesanderson::wes_palette("Moonrise3")) +
+  scale_alpha_manual(
+    "Column\nNormalization", values = c("Yes" = 1, "No" = 0.5)
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  guides(shape = guide_legend(nrow=2,byrow=TRUE), color = guide_legend(nrow=2,byrow=TRUE), alpha = guide_legend(nrow=2,byrow=TRUE))
+
+normalization_choice_plot
+create_and_upload_figure(
+  name = "sample_v_posctrl_rmse",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure1/Supp",
+  width = 7,
+  height = 7,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+
+```
+
+## Protein Bridge Centering
+
+These plots were already generated in featurization_proteomics_compms.Rmd so we can just copy them as-is.
+
+```{r proteomics_plots}
+proteomics_informatics_plot_path <- file.path(load_domics("informatics", domics_paths), "proteomics", "out_figures")
+
+select_proteomics_plots <- c("batch_post_correction-1.png", "tmt_ra_correlations-1.png", "tmt_bridge_correlations-1.png")
+
+file.path(proteomics_informatics_plot_path, select_proteomics_plots) %>%
+  purrr::walk(
+  calibase::upload_to_drive,
+  drive_path = "Plots/proteomics_informatics",
+  drive_root = manuscript_drive_root
+)
+```

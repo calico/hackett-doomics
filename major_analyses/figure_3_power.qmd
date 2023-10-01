@@ -1,0 +1,139 @@
+---
+title: "Figure 3 - Side Analysis - Power"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+To identify molecular hallmarks of aging and longevity, diverse biomarkers of 110 Diversity Outcross (DO) mice were measured at each 3 timepoints (8, 14, and 20 months) and each biomarker's abundance was regressed on longevity, age timepoint, sex. 
+
+To assess our power in identifying age or longevity-related changes in biomarkers, I carried out simulation where the signal of interest of varying effect sizes was adulterated with varying amounts of noise (random normal with variable sigma) and assessed the power with which we could detect such signals. Effect sizes are the true fold-change difference between the oldest/longest-lived mouse and the youngest/shortest-lived mouse. Age-related changes are modeled as a linear change in a biomarker's abundance across 3 uniformly spaced timepoints each containing 110 observations. Lifespan-related changes are modeled as a linear change in a biomarker's abundance across 110 uniformly spaced lifespans each containing 3 observations (i.e., one mouse).
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+library(patchwork)
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+```
+
+```{r power_simulation, cache = TRUE}
+n_mice <- 110
+n_simulations <- 1000
+target_alpha = 0.05
+
+# define effect sizes and noise
+grid_length <- 40
+parameter_grid <- expand.grid(beta = seq(0.1, 1, length.out = grid_length), sigma = seq(0.1, 1.2, length.out = grid_length))
+
+fit_lm <- function(x_design, expectation_y, noise) {
+  vals <- broom::tidy(lm(formula = rnorm(n = nrow(expectation_y), mean = expectation_y, sd = noise) ~ x_design + 0))$p.value
+  vals[length(vals)]
+}
+
+### age effect
+# equal sized bins of 0, 0.5, 1
+x_design = model.matrix(~ factor(rep(c(0, 1, 2), each = n_mice))) # these are just indexes 
+parameter_grid$power_age <- purrr::map_dbl(1:nrow(parameter_grid), function(i) {
+  betas <- c(0, 0.5 * parameter_grid$beta[i], parameter_grid$beta[i])
+  expectation_y = x_design %*% betas
+  noise <- sqrt(parameter_grid$sigma[i]^2*2)
+  
+  sum(replicate(n_simulations, fit_lm(x_design, expectation_y, noise)) < target_alpha)/n_simulations
+  })
+
+### longevity effect
+# uniform longevity across individuals
+x_design = model.matrix(~ rep(seq(0, 1, length.out = n_mice), each = 3))
+parameter_grid$power_longevity <- purrr::map_dbl(1:nrow(parameter_grid), function(i) {
+  betas <- c(0, parameter_grid$beta[i])
+  expectation_y = x_design %*% betas
+  noise <- parameter_grid$sigma[i]
+  
+  sum(replicate(n_simulations, fit_lm(x_design, expectation_y, noise)) < target_alpha)/n_simulations
+  })
+
+### age x lifespan effects
+# uniform longevity effect which is age-specific
+x_design = cbind(early_age = c(rep(0.5, n_mice), rep(0, n_mice)), late_age = c(rep(0, n_mice), rep(1, n_mice))) * rep(seq(0, 1, length.out = n_mice), times = 2)
+  
+parameter_grid$power_age_x_longevity <- purrr::map_dbl(1:nrow(parameter_grid), function(i) {
+  betas <- c(parameter_grid$beta[i], parameter_grid$beta[i])
+  expectation_y = x_design %*% betas
+  # doubling of variance due to taking the fold-change difference of normals
+  noise <- sqrt(parameter_grid$sigma[i]^2*2)
+  
+  sum(replicate(n_simulations, fit_lm(x_design, expectation_y, noise)) < target_alpha)/n_simulations
+  })
+
+
+```
+
+```{r power_plots, dependson="power_simulation", fig.height = 11, fig.width = 12}
+renamed_parameter_grid <- parameter_grid %>%
+  dplyr::rename(
+    `age: linear changes over 3 uniformly-spaced ages (x110 mice)\n(effect is oldest - youngest)` = power_age,
+    `lifespan: linear changes over 110 uniformly-spaced longevities (x3 ages)\n(effect is longest - shortest lived)` = power_longevity,
+    `age x lifespan: age-specific linear change with lifespan\n(effect is longest - shortest lived in old animals)` = power_age_x_longevity
+    ) %>%
+  tidyr::gather(trait, power, -beta, -sigma)
+
+power_by_effect_size_plot <- ggplot(data = renamed_parameter_grid, aes(x = beta, y = power, color = sigma, group = sigma)) + 
+  geom_path(size = 2) +
+  scale_color_viridis_c("noise (sd of random Normal)", option  = "A", direction = -1) +
+  facet_wrap(~ trait, ncol = 1) +
+  scale_x_continuous("Effect size", expand = c(0,0)) +
+  scale_y_continuous(expression("Power at" ~ alpha ~ "= 0.05"), expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position = "bottom", text = element_text(size = 12), legend.key.size = grid::unit(1, "cm"))
+
+effect_size_by_sd_plot <- ggplot(data = renamed_parameter_grid, aes(x = beta, y = sigma, fill = power)) + 
+  geom_tile() +
+  scale_fill_viridis_c(expression("Power at" ~ alpha ~ "= 0.05"), limits = c(0,1), option = "F") +
+  facet_wrap(~ trait, ncol = 1) +
+  scale_y_continuous("Noise (sd of random Normal)", expand = c(0,0)) +
+  scale_x_continuous("Effect size", expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position = "bottom", text = element_text(size = 12), legend.key.size = grid::unit(1, "cm"))
+
+(power_by_effect_size_plot+effect_size_by_sd_plot) + 
+  plot_annotation(title = "Power to detect biomarker changes", theme = theme(text = element_text(size = 20)), tag_levels = 'A')
+
+create_and_upload_figure(
+  name = "power_analysis",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure3/Supp",
+  width = 12,
+  height = 11,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".pdf", ".png")
+)
+
+```
+
+## Power with realistic noise
+
+```{r}
+renamed_parameter_grid %>%
+  filter(sigma > 0.75, power > 0.9) %>%
+  arrange(beta) %>%
+  group_by(trait) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(., 2))) %>%
+  knitr::kable() %>%
+  kableExtra::kable_paper()
+
+```

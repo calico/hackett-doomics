@@ -1,0 +1,223 @@
+---
+title: "Figure 2: Exploratory Data Analysis - Side Analysis - Defining the Late Blood Draw and Early Generation 8 Effects"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The DO samples used in this study were collected over an ~ 3 year time span. Since we are not interested in the time of year or the year when a sample was generated variation introduced by differences in sample handling over the course of the study are nuisance variables. From preliminary EDA, it is clear that there was a large switch that occurred at some point in the study which greatly affected the metabolomic composition of subsequently generated samples. This switch is partially confounded with both age and generation, and it looks like handling of different generations of mice differed. As a result the point when large switches are seen to impact samples differs slightly across samples.
+
+Since we can not find a specific experimental variables which nicely explains the difference in handling, this notebook will layout a procedure for identifying these switches from the data itself. Since this work will use the information across >1,000 metabolites and we will not explicitly look at the variables of primary interest (age and lifespan), I believe that the somewhat manual nature of covariate selection will still result in statistically sound downstream analyses. 
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+features_with_design <- load_domics("features", domics_paths)
+```
+
+## Random metabolite examples
+
+```{r met_examples, fig.width = 10, fig.height = 10}
+metabolomics_data <- features_with_design %>%
+  dplyr::filter(data_type %in% c("metabolites-neg", "metabolites-pos"))
+
+random_metabolites <- metabolomics_data %>%
+  dplyr::distinct(groupId) %>%
+  dplyr::sample_n(20)
+
+metabolomics_data %>%
+  dplyr::semi_join(random_metabolites, by = "groupId") %>%
+  ggplot(aes(x = Draw_date, y = normalized_log2_abundance, color = Generation)) +
+  geom_point() +
+  facet_wrap(~ groupId, scale = "free_y")
+
+metabolomics_data %>%
+  dplyr::semi_join(random_metabolites, by = "groupId") %>%
+  ggplot(aes(x = Age, y = normalized_log2_abundance, fill = Generation)) +
+  geom_boxplot() +
+  facet_wrap(~ groupId, scale = "free_y")
+```
+
+## Late Blood Draw Effect
+
+The 20 months timepoints of G9, G10, and G11 looked different from the 20 month G7 and G8 observations.
+Many of the 14 month timepoints of G11 also fell in with the G9, G10, G11 20 month observations likely becasue these 14 month draws were the last 14 month draws to be collected. All other 14 month samples and all of the 8 month samples didn't exhibit large generation effects.
+
+Accounting for the 20 month generation differences is easy, but identifying the breakpoint reflecting the large difference between the first and final G11 samples requires a closer look at the data.
+
+```{r late_blood_draw, fig.width = 6, fig.height = 6}
+# find metabolites with large differences in 20 month G9-G11 versus 20 month G7,8
+gen_averages <- metabolomics_data %>%
+  dplyr::filter(Age == "20 months") %>%
+  dplyr::group_by(groupId, Generation) %>%
+  dplyr::summarize(
+    late_gen_median = median(normalized_log2_abundance),
+    late_gen_sd = sd(normalized_log2_abundance),
+    .groups = "drop"
+    )
+
+large_gen_effects <- gen_averages %>%
+  select(-late_gen_sd) %>%
+  tidyr::spread(Generation, late_gen_median) %>%
+  dplyr::mutate(late_gen_minus_early_gen = (G9 + G10 + G11)/3 - (G7 + G8)/2) %>%
+  dplyr::left_join(
+    gen_averages %>%
+      group_by(groupId) %>%
+      summarize(avg_late_gen_sd = mean(late_gen_sd), .groups = "drop"),
+    by = "groupId"
+  ) %>%
+  dplyr::arrange(desc(abs(late_gen_minus_early_gen) / avg_late_gen_sd)) %>%
+  dplyr::ungroup() %>%
+  dplyr::slice(1:6)
+
+large_gen_effects %>%
+  dplyr::slice(1:6) %>%
+  knitr::kable()
+
+like_a_middle_aged_g11 <- metabolomics_data %>%
+  dplyr::filter(Generation == "G11",
+                Age == "14 months")
+
+like_a_middle_aged_g11_aug <- like_a_middle_aged_g11 %>%
+  dplyr::inner_join(
+    like_a_middle_aged_g11 %>%
+      dplyr::distinct(set, sample, Draw_date) %>%
+      dplyr::arrange(Draw_date) %>%
+      dplyr::mutate(draw_order = 1:n()) %>%
+      dplyr::select(-Draw_date),
+    by = c("set", "sample")) %>%
+  dplyr::mutate(lbd = dplyr::case_when(Generation == "G11" & Draw_date >= "2013-10-09" ~ TRUE,
+                                       Generation %in% c("G9", "G10") & Age == "20 months" ~ TRUE,
+                                       TRUE ~ FALSE))
+
+# looking just at 14 month G11s
+lbd_plot <- like_a_middle_aged_g11_aug %>%
+  dplyr::semi_join(large_gen_effects, by = "groupId") %>%
+  mutate(lbd_status = factor(
+    ifelse(lbd, "Late Blood Draw Effect", "None"),
+    c("None", "Late Blood Draw Effect")
+    )) %>%
+  ggplot(aes(x = draw_order, y = normalized_log2_abundance, color = lbd_status)) +
+  geom_point() +
+  facet_wrap(~ feature_name, scale = "free_y") +
+  theme_bw() +
+  scale_color_discrete("Late blood draw status") +
+  scale_x_continuous("Blood draw order") +
+  scale_y_continuous(expression(log[2] ~ "abundance")) +
+  ggtitle("Examples of metabolites strongly impacted by the\n\"late blood draw\" effect in G11 14 months") +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+lbd_plot
+create_and_upload_figure(
+  name = "lbd_plot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 6,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".pdf", ".png")
+)
+```
+
+## Early G8 effect
+
+In addition to the late blood draw effect, there is a clear difference in the molecular profiles of generation 8 mice. This difference impacts all of the 8 month blood draws, as well as a portion of the 14 month blood draws. This effect is kind of confusing because measurements of other generations happened between the 8 and 14 month 8 blood draws, and these measurements do not display this effect.
+
+Similarly to what needed be done on the late blood draw effect, identifying the breakpoint reflecting the large difference between the first and final G8 14 month samples requires a closer look at the data.
+
+```{r early_g8, fig.width = 6, fig.height = 6}
+like_a_g8 <- metabolomics_data %>%
+  dplyr::filter(Generation == "G8")
+
+like_a_g8_aug <- like_a_g8 %>%
+  dplyr::inner_join(
+    like_a_g8 %>%
+      dplyr::distinct(set, sample, Draw_date) %>%
+      dplyr::arrange(Draw_date) %>%
+      dplyr::mutate(draw_order = 1:n()) %>%
+      dplyr::select(-Draw_date),
+    by = c("set", "sample")) %>%
+  dplyr::mutate(eg8 = dplyr::case_when(Generation == "G8" & Draw_date < "2012-12-10" ~ TRUE,
+                                       TRUE ~ FALSE))
+
+oe_diffs <- metabolomics_data %>%
+  dplyr::group_by(groupId, Age, Generation) %>%
+  dplyr::summarize(
+    abundance = median(normalized_log2_abundance),
+    met_sd = sd(normalized_log2_abundance),
+    .groups = "drop"
+  )
+
+top_oe_diffs <- oe_diffs %>%
+  select(-met_sd) %>%
+  tidyr::spread(Generation, abundance) %>%
+  dplyr::mutate(
+    g_diff = abs(G8 - (G7 + G9 + G10 + G11)/4)) %>%
+  dplyr::select(groupId, Age, g_diff) %>%
+  tidyr::spread(Age, g_diff) %>%
+  dplyr::mutate(oe_diff = `20 months` - `8 months`) %>%
+  #
+  left_join(
+    oe_diffs %>%
+      filter(Age != "14 months") %>%
+      group_by(groupId) %>%
+      summarize(met_sd = mean(met_sd), .groups = "drop"),
+    by = "groupId"
+  ) %>%
+  dplyr::arrange(desc(abs(oe_diff)/met_sd)) %>%
+  dplyr::ungroup() %>%
+  dplyr::slice(1:6)
+
+eg8_plot <- like_a_g8_aug %>%
+  dplyr::semi_join(top_oe_diffs, by = "groupId") %>%
+  mutate(eg8_status = factor(
+    ifelse(eg8, "Early Generation 8 Effect", "None"),
+    c("None", "Early Generation 8 Effect")
+    )) %>%
+  ggplot(aes(x = draw_order, y = normalized_log2_abundance, color = Age, shape = eg8_status)) +
+  geom_point() +
+  scale_shape_discrete("Early G8 Status") +
+  scale_x_continuous("Blood draw order") +
+  scale_y_continuous(expression(log[2] ~ "abundance")) +
+  scale_color_manual(values = c("8 months" = "goldenrod1", "14 months" = "darkorange2", "20 months" = "darkred")) +
+  facet_wrap(~ feature_name, scale = "free_y") +
+  theme_bw() +
+  ggtitle("Examples of metabolites strongly impacted by the\n\"Early Generation 8\" effect at 14 months") +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+  guides(color=guide_legend(ncol=1, byrow=TRUE), shape = guide_legend(ncol=1, byrow=TRUE))
+
+eg8_plot
+create_and_upload_figure(
+  name = "eg8_plot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 6,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".pdf", ".png")
+)
+```
+
