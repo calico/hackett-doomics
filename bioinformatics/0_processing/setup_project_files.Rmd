@@ -14,9 +14,9 @@ DO_drive_path <- googledrive::as_id("1RTEt3GeUt4h4Z918FfoAAvfwywNxtxPW")
 # add mysql connections
 standard_databases <- clamshell::configure_db_access()
 
-nfs_root = "/group/massspec/PROJECTS/2020_DO_multiomics"
+nfs_root = Sys.getenv("doomics_zfs_root")
 annotations_dir <- file.path(nfs_root, "annotations")
-met_dataset_path = "/group/massspec/met_datasets"
+met_dataset_path = Sys.getenv("met_dataset_path")
 
 # source utils
 source("utils_setup_project_files.R")

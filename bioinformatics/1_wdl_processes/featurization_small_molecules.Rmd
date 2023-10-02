@@ -1,0 +1,692 @@
+---
+title: "Small Molecules Featurization"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+params:
+  set: "1/2"
+  dataset_path: "data/4_split/M002A_split_12.mzrollDB"
+  inclusion_list: "polar_metabolites_pos_files_to_include.txt"
+  normalization_var: "loading_b_centered_log2_abundance"
+  run_outdir: "/tmp/featurization.metabolomics"
+  annotation_data_type: "metabolomics-pos"
+  n_slurm_jobs: "50"
+tags:
+- "diversity outcross"
+- "small molecules"
+- "normalization"
+- "biomarkers"
+---
+
+```{r package_loading, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(claman)
+
+params <- list(
+  project_path = Sys.getenv("doomics_zfs_root"),
+  do_drive_token = Sys.genev("doomics_drive_working_uri"),
+  repo_path = Sys.getenv("doomics_repo_path")
+)
+
+source(file.path(params$repo_path, "utils", "data_prep.R"))
+source(file.path(params$repo_path, "utils", "support_fxns.R"))
+
+if (!file.exists(params$run_outdir)) {
+  dir.create(params$run_outdir)
+  }
+dir.create(file.path(params$run_outdir, "out_files"))
+dir.create(file.path(params$run_outdir, "out_figures"))
+
+knitr::kable(tibble::tibble(parameters = names(params),
+                            values = unname(unlist(params))))
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(
+  fig.path = file.path(params$run_outdir, "out_figures/"),
+  out.width='2000px',
+  dpi = 200
+)
+```
+
+# Load Data and Meta-data
+
+```{r data_loading, warning = FALSE, message = FALSE}
+full_dataset_path <- file.path(params$project_path, params$dataset_path)
+
+if (params$inclusion_list == "") {
+  full_inclusion_file_path = NA_character_
+} else {
+  full_inclusion_file_path = file.path(params$repo_path, "supporting_files",
+                                       "inclusion_lists", params$inclusion_list)
+}
+
+# load all small molecule results as an mzroll_list (from claman)
+small_molecules <- read_small_molecules(full_dataset_path, full_inclusion_file_path)
+
+malformed_measurements <- small_molecules$measurements %>%
+  dplyr::inner_join(
+    small_molecules$features %>%
+      dplyr::select(groupId, searchTableName),
+    by = "groupId") %>%
+  dplyr::filter(!is.na(log2_abundance)) %>%
+  dplyr::distinct(sampleId, searchTableName) %>%
+  dplyr::count(sampleId) %>%
+  dplyr::filter(n != max(n))
+  
+if (nrow(malformed_measurements) != 0) {
+  stop(glue::glue(
+    "{nrow(malformed_measurements) samples were missing all measurements
+    - of one or more types"
+    ))
+}
+
+# filter unknowns from lipidomics
+
+if (params$annotation_data_type %in% c("lipids-neg", "lipids-pos")) {
+  print("Filtering lipidomics unknowns")
+   
+  small_molecules <- romic::filter_tomic(
+    small_molecules,
+    "category",
+    "features",
+    FALSE,
+    "is_unknown"
+  )
+}
+
+# floor and fill in missing sample observations with limit of detection
+small_molecules <- claman::floor_peaks(small_molecules, params$log2_limit)
+```
+
+## Compare Bookmarks with Matched Reextracted Features
+
+```{r reextraction}
+bookmark_eic_comparison <- small_molecules$features %>%
+  dplyr::filter(searchTableName %in% c("Bookmarks", "EICs")) %>%
+  # add an adductName for all bookmarks/eics since unknowns won't have them
+  dplyr::mutate(adductName = ifelse(
+    is.na(adductName),
+    ifelse(stringr::str_detect(params$annotation_data_type, "neg"), "[M-H]-", "[M+H]+"),
+    adductName
+    )) %>%
+  dplyr::group_by(compoundName, adductName) %>%
+  dplyr::filter(
+    n() == 2,
+    "Bookmarks" %in% searchTableName,
+    "EICs" %in% searchTableName
+    ) %>%
+  dplyr::select(groupId, compoundName, adductName, searchTableName) %>%
+  dplyr::ungroup()
+
+comparison_measurements <- small_molecules$measurements %>%
+  dplyr::inner_join(bookmark_eic_comparison, by = "groupId") %>%
+  dplyr::select(-centered_log2_abundance, -groupId) %>%
+  tidyr::spread(searchTableName, log2_abundance)
+
+ggplot(comparison_measurements, aes(x = Bookmarks, y = EICs)) +
+  geom_hex(bins = 50) +
+  scale_fill_viridis_c(trans = "sqrt") +
+  ggtitle("Boomarks and Reextracted EICs of the Same Peak Agree")
+
+# discard EICs when both types of measurements are present
+
+deduplicated_features <- small_molecules$features %>%
+  dplyr::anti_join(
+    bookmark_eic_comparison %>%
+      dplyr::filter(searchTableName == "EICs"),
+    by = "groupId")
+
+small_molecules <- romic::update_tomic(small_molecules, deduplicated_features)
+```
+
+```{r sample_loading, warning = FALSE, message = FALSE}
+# summarize number of samples (including blank, negctl, posctl...)
+sample_summary <- small_molecules$samples %>%
+  dplyr::count(unique_batch, sample_type) %>%
+  tidyr::spread(sample_type, n)
+
+knitr::kable(sample_summary)
+
+if (params$set != "3") {
+
+  design_matrix <- read_design_matrix(file.path(params$repo_path, "supporting_files",
+                                                "design_matrix_set1_and_set2.csv"))
+
+  missing_samples <- design_matrix %>%
+    dplyr::anti_join(small_molecules$samples, by = "sample_id")
+
+  if (nrow(missing_samples) != 0) {
+    stop (nrow(missing_samples), " samples were not detected in the datasets which are present in the design_matrix")
+  }
+} else {
+  warning ("no design matrix to compare to")
+}
+```
+
+# Filter bad peakgroups and normalize batch effects
+
+## Filter peakgroups
+
+### Find biololgically-enriched peakgroups
+
+Peakgroups with less signal in biological samples than negative controls were already filtered by <utils_setup_project_files.R> detect_bioenriched_peakgroups(), here we apply a more stringent cutoffs on enrichment (4-fold higher in biological samples) and representation (present in 90% of samples).
+
+```{r id_bio_peaks, fig.height = 8, fig.width = 8}
+gross_batch_var_co <- 1.5
+
+tall_preliminary <- small_molecules$measurements %>%
+  dplyr::left_join(small_molecules$samples %>%
+                     dplyr::select(sampleId, sample_type, sample_id, unique_batch),
+                   by = "sampleId")
+
+samples_versus_negctl_df <- tall_preliminary %>%
+  # filter to just blanks and samples
+  dplyr::filter(sample_type %in% c("negctl", "sample")) %>%
+  dplyr::select(groupId, sample_id, sample_type, log2_abundance)
+
+# determine which compounds have biologically interesting patterns of variation compared to negative controls
+
+mean_diff <- samples_versus_negctl_df %>%
+  # determine the mean ion count within blanks versus samples
+  dplyr::group_by(groupId, sample_type) %>%
+  dplyr::summarize(mean_log2_ic = mean(log2_abundance), .groups = "drop") %>%
+  tidyr::spread(key = sample_type, value = mean_log2_ic) %>%
+  dplyr::ungroup()
+
+above_limit_tresh = 0.9
+
+zero_counts <- samples_versus_negctl_df %>%
+  dplyr::filter(sample_type == "sample") %>%
+  dplyr::mutate(above_limit = log2_abundance > params$log2_limit + 0.001,
+                above_limit = factor(above_limit, levels = c("TRUE", "FALSE"))) %>%
+  dplyr::count(groupId, above_limit) %>%
+  tidyr::spread(above_limit, n, fill = 0, drop = FALSE) %>%
+  dplyr::mutate(above_limit_frac = `TRUE`/(`FALSE` + `TRUE`)) %>%
+  # filter all peakgroups missing in greater than 1 - above_limit_tresh of samples
+  dplyr::filter(above_limit_frac > above_limit_tresh)
+
+bioenriched_pgs <- mean_diff %>%
+  # 4-old enriched in biological samples
+  dplyr::filter(sample - negctl > 2) %>%
+  # present in most biological samples
+  dplyr::semi_join(zero_counts, by = "groupId") %>%
+  dplyr::distinct(groupId) %>%
+  dplyr::mutate(bio_type = "elevated in biological samples")
+
+manually_annotated_pgs <- small_molecules$features %>%
+  dplyr::filter(!is_unknown) %>%
+  dplyr::select(groupId) %>%
+  dplyr::mutate(bio_type = "manually annotated")
+
+bio_peaks <- dplyr::bind_rows(bioenriched_pgs,
+                              manually_annotated_pgs) %>%
+  dplyr::mutate(bio_type = factor(bio_type, levels = c("manually annotated", "elevated in biological samples", "background"))) %>%
+  dplyr::group_by(groupId) %>%
+  dplyr::arrange(bio_type) %>%
+  dplyr::slice(1)
+
+mean_diff <- mean_diff %>%
+  dplyr::left_join(bio_peaks, by = "groupId") %>%
+  dplyr::mutate(bio_type = dplyr::case_when(!is.na(bio_type) ~ bio_type,
+                                            TRUE ~ factor("background", levels = levels(bio_peaks$bio_type))))
+bio_compound_count <- mean_diff %>%
+  dplyr::filter(bio_type != "background") %>%
+  dplyr::summarize(label = paste0(n(), " valid ions"))
+
+mean_diff %>%
+  dplyr::arrange(desc(bio_type)) %>%
+  ggplot(aes(x = negctl, y = sample, color = bio_type)) + 
+  geom_point(size = 0.5) +
+  geom_text(data = bio_compound_count, aes(x = -Inf, y = Inf, label = label), hjust = 0, vjust = 1, color = "RED", size = 6) +
+  coord_equal() +
+  scale_x_continuous("log2 mean ion count across negative controls", expand = c(0,0)) +
+  scale_y_continuous("log2 mean ion count across samples", expand = c(0,0)) +
+  theme_minimal() + theme(legend.position = "bottom", text = element_text(size = 20)) +
+  scale_color_manual(NULL, values = c("background" = "gray50", "elevated in biological samples" = "dodgerblue", "manually annotated" = "coral2")) +
+  ggtitle(paste0(nrow(mean_diff), " ions detected")) +
+  guides(color = guide_legend(override.aes =  list(size = 5)))
+```
+
+### Show annotated peakgroups which aren't biologically enriched
+
+```{r low_abund_annotations}
+mean_diff %>%
+  dplyr::filter(bio_type == "manually annotated") %>%
+  dplyr::filter(sample < negctl + 2) %>%
+  dplyr::left_join(small_molecules$features  %>%
+                     dplyr::select(groupId, compoundName),
+                   by = "groupId") %>%
+  DT::datatable()
+```
+
+### Quantify missingness
+
+```{r missingness, fig.height = 8, fig.width = 8}
+dataset_nonmissing_sample_fractions <- tall_preliminary %>%
+  dplyr::semi_join(bio_peaks, by = "groupId") %>%
+  dplyr::filter(sample_type %in% c("sample", "posctl")) %>%
+  dplyr::group_by(groupId) %>%
+  dplyr::summarize(nonmissing_frac = sum(log2_abundance > params$log2_limit + 0.001)/n())
+
+ggplot(dataset_nonmissing_sample_fractions, aes(x = nonmissing_frac)) +
+  geom_histogram(binwidth = 0.05) +
+  scale_x_continuous("Fraction of non-missing samples") +
+  scale_y_continuous("Count") +
+  theme_minimal() +
+  theme(legend.position = "bottom", text = element_text(size = 20),
+        axis.text.x = element_text(angle = 60), strip.background = element_rect(fill = "gray90"),
+        panel.spacing = grid::unit(2, "lines"))
+```
+
+
+### Find peakgroups with massive batch effects
+
+```{r remove_batch_effects_adulterated_peakgroups}
+gross_batch_var_co <- 1.5
+
+# remove massive batch effects (that are likely due to inappropriate extraction)
+gross_batch_variation <- tall_preliminary %>%
+  dplyr::semi_join(bio_peaks, by = "groupId") %>%
+  dplyr::filter(sample_type %in% c("sample", "posctl")) %>%
+  dplyr::group_by(groupId, unique_batch) %>%
+  dplyr::summarize(batch_mean_log2_abundance = mean(log2_abundance), .groups = "drop") %>%
+  dplyr::group_by(groupId) %>%
+  dplyr::summarize(
+    sd_batch_means = sd(batch_mean_log2_abundance),
+    mean_batch_means = mean(batch_mean_log2_abundance),
+    .groups = "drop"
+    )
+
+limited_gross_var_peaks <- gross_batch_variation %>%
+  dplyr::filter(sd_batch_means < gross_batch_var_co)
+
+ggplot(gross_batch_variation, aes(x = mean_batch_means, y = sd_batch_means)) + 
+  geom_hex(bins = 30, color = NA) +
+  geom_hline(yintercept = gross_batch_var_co, size = 2, linetype = 2) +
+  scale_fill_gradientn(colors = c("gray90", "red", "firebrick4"), trans = "log2") +
+  scale_x_continuous(expression(log[2] ~ "mean of batch means")) +
+  scale_y_continuous(expression("SD across " ~ log[2] ~ "batch means")) +
+  theme_minimal() +
+  theme(text = element_text(size = 20), strip.background = element_rect(fill = "gray90"), panel.spacing = grid::unit(2, "lines"))
+```
+
+## Normalization
+
+### Sample-level normalization to adjust for loading
+
+Use a median polish which is robust to missing values. Take the median of log non-missing values for each peak (below the limit of detection) across only samples. For each sample, take the median ratio of non-missing peaks relative to the corresponding "average peak". This is a robust average relative abundance of a sample compared to a typical sample; divide all ic by this average.
+
+Non biological samples are adjusted by the average of biological sample for the same batch (batch nested within set).
+
+```{r loading_control, fig.height = 8, fig.width = 8}
+bio_small_molecules <- small_molecules %>%
+  # filter to biologically-enriched peakgroups
+  romic::filter_tomic("category", "features", bio_peaks$groupId, "groupId") %>%
+  # filter to peakgroups without massive batch effects
+  # retain manually annotated features w/ or w/o batch effects
+  romic::filter_tomic("category", "features", union(limited_gross_var_peaks$groupId, manually_annotated_pgs$groupId), "groupId") %>%
+  # filter to biological samples
+  romic::filter_tomic("category", "samples", c("sample", "posctl"), "sample_type")
+
+# add peak-abundances with sample-level loading correction
+loading_controlled <- claman::normalize_peaks(
+  bio_small_molecules,
+  normalization_method = "median polish",
+  quant_peak_varname = "log2_abundance",
+  norm_peak_varname = "loading_log2_abundance",
+  log2_floor_value = params$log2_limit
+  )
+
+sample_diffs <- loading_controlled$measurements %>%
+  dplyr::group_by(sampleId) %>%
+  dplyr::mutate(diff = loading_log2_abundance - log2_abundance) %>%
+  dplyr::summarize(log2_loading_diff = median(diff)) %>%
+  dplyr::left_join(loading_controlled$samples %>%
+                     dplyr::select(sampleId, unique_batch, sample_type),
+                   by = "sampleId")
+
+ggplot(sample_diffs, aes(x = unique_batch, y = log2_loading_diff, color = sample_type)) +
+  geom_jitter(width = 0.125, height = 0) +
+  scale_x_discrete("Batch") +
+  scale_y_continuous('Relative signal compared to "average" sample') +
+  scale_color_brewer("Sample Type", palette = "Set1") +
+  theme_minimal() +
+  theme(legend.position = "bottom", text = element_text(size = 20),
+        axis.text.x = element_text(angle = 60, hjust = 0.5, vjust = 0.5),
+        strip.background = element_rect(fill = "gray90"), panel.spacing = grid::unit(2, "lines"))
+```
+
+### Injection consistency
+
+Two injections of a given sample are present for most positive and negative soluble metabolite samples. These replicate injections are highly correlated because they are both the same sample (and have the same batch effects). To reduce the uncertainty in each sample's measurement, after confirming that injections are highly correlated, we collapsed injections using the mean of log ion count.
+
+```{r injection_comparison, fig.height = 6, fig.width = 10}
+loading_control_just_samples <- romic::filter_tomic(
+  loading_controlled,
+  "category",
+  "samples",
+  "sample",
+  "sample_type"
+  )
+  
+duplicate_injections_exist <- loading_control_just_samples$samples %>%
+  dplyr::count(sample_id) %>%
+  dplyr::filter(n > 1) %>%
+  nrow() %>%
+  {. != 0}
+
+if (duplicate_injections_exist) {
+  claman::plot_compare_injection(
+    loading_control_just_samples,
+    "sample_id",
+    "loading_log2_abundance"
+  )
+}
+```
+
+```{r duplicate_injections_summary}
+if (duplicate_injections_exist) {
+  DT::datatable(loading_control_just_samples$samples %>%
+                  dplyr::count(sample_id) %>%
+                  dplyr::filter(n > 1))
+}
+```
+
+### Collapse injections
+
+```{r collapse_injections}
+# dealing with inappropriate injection replciates
+# remove once talking with Bryson
+if ("datetime" %in% colnames(loading_controlled$samples)) {
+  
+  loading_controlled$samples <- loading_controlled$samples %>%
+    dplyr::group_by(sample_id) %>%
+    dplyr::mutate(datetime = last(datetime)) %>%
+    dplyr::ungroup()
+  
+}
+
+if (duplicate_injections_exist) {
+  collapsed_replicates <- claman::collapse_injections(
+    loading_controlled,
+    grouping_vars = c("sample_id", "unique_batch"),
+    peak_quant_vars = c("log2_abundance", "loading_log2_abundance"),
+    collapse_fxn = "mean"
+    )
+} else {
+  collapsed_replicates <- loading_controlled
+}
+```
+
+### Remove Batch Effects
+
+```{r normalization, fig.height = 15, fig.width = 15}
+# chain multiple normalizaioin methods by adding additional variables to peaks
+
+# center batches
+normalized_peaks <- claman::normalize_peaks(
+    collapsed_replicates,
+    normalization_method = "center batches",
+    quant_peak_varname = "log2_abundance",
+    norm_peak_varname = "b_centered_log2_abundance",
+    batch_varnames = "unique_batch",
+    log2_floor_value = params$log2_limit,
+    centering_fxn = median
+  ) %>%
+  claman::normalize_peaks(
+    normalization_method = "center batches",
+    quant_peak_varname = "loading_log2_abundance",
+    norm_peak_varname = "loading_b_centered_log2_abundance",
+    batch_varnames = "unique_batch",
+    log2_floor_value = params$log2_limit,
+    centering_fxn = median
+  ) %>%
+  # compare samples to positive controls within the same batch
+  claman::normalize_peaks(
+    normalization_method = "reference sample",
+    quant_peak_varname = "log2_abundance",
+    norm_peak_varname = "b_reference_log2_abundance",
+    batch_varnames = "unique_batch",
+    reference_varname = "sample",
+    reference_values = "posctl",
+    log2_floor_value = params$log2_limit
+    ) %>%
+  claman::normalize_peaks(
+    normalization_method = "reference sample",
+    quant_peak_varname = "loading_log2_abundance",
+    norm_peak_varname = "loading_b_reference_log2_abundance",
+    batch_varnames = "unique_batch",
+    reference_varname = "sample",
+    reference_values = "posctl",
+    log2_floor_value = params$log2_limit
+    )
+```
+
+```{r loess_normalization}
+# add loess normalization if datetime is available
+
+if ("datetime" %in% colnames(normalized_peaks$samples)) {
+  
+  weights_tribble <- tibble::tribble(
+    ~ sample_type, ~ weights,
+    "sample", 1,
+    "posctl", 100
+    ) %>%
+    dplyr::mutate(sample_type = factor(sample_type, levels = levels(collapsed_replicates$samples$sample_type)))
+  
+  # batch adjust with loess
+  normalized_peaks <- claman::normalize_peaks(
+    normalized_peaks,
+    normalization_method = "loess",
+    quant_peak_varname = "log2_abundance",
+    norm_peak_varname = "loess_log2_abundance",
+    weights_tribble = weights_tribble,
+    log2_floor_value = params$log2_limit
+    ) %>%
+    claman::normalize_peaks(
+      normalization_method = "loess",
+      quant_peak_varname = "loading_log2_abundance",
+      norm_peak_varname = "loading_loess_log2_abundance",
+      weights_tribble = weights_tribble,
+      log2_floor_value = params$log2_limit
+      )
+   
+  group_subset <- normalized_peaks$features %>%
+                       dplyr::sample_n(12)
+  
+  loess_subset <- normalized_peaks$measurements %>%
+    dplyr::semi_join(group_subset, by = "groupId") %>%
+    dplyr::left_join(normalized_peaks$samples %>%
+                       dplyr::select(sampleId, datetime, unique_batch, sample_type), by = "sampleId") %>%
+    dplyr::arrange(datetime)
+  
+  ggplot(loess_subset, aes(x = datetime, y = loading_log2_abundance, color = unique_batch, shape = sample_type, alpha = sample_type)) +
+    geom_point() +
+    geom_path(aes(y = .loess_fit)) +
+    scale_shape_manual(values = c("posctl" = 15, "sample" = 20)) +
+    scale_alpha_manual(values = c("posctl" = 1, "sample" = 0.4)) +
+    facet_wrap(~ groupId, scales = "free", ncol = 4) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90))
+}
+```
+
+### Compare positive controls
+
+Each batch of experimental samples was run with a positive control. Because batch effects on the intensity of individual species can be quite strong, it is important to assess whether these systematic differences are being dealt with through sample and batch-level normalization. In order to evaluate the efficacy of such normalization strategies, we can look at the consistency of positive controls throughout processing.
+
+```{r variance_summaries, fig.height = 8, fig.width = 8}
+posctl_summary <- normalized_peaks %>%
+  romic::filter_tomic("category", "samples", "posctl",  "sample_type") %>%
+  {.$measurements} %>%
+  tidyr::gather(processing, log2_abundance, -groupId, -sampleId) %>%
+  dplyr::filter(log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::group_by(processing, groupId) %>%
+  dplyr::filter(n() > 2) %>%
+  dplyr::summarize(
+    posctl_mean = mean(log2_abundance),
+    posctl_sd = sd(log2_abundance),
+    .groups = "drop"
+    ) %>%
+  dplyr::ungroup()
+
+sample_summary <- normalized_peaks %>%
+  romic::filter_tomic("category", "samples", "sample",  "sample_type") %>%
+  {.$measurements} %>%
+  tidyr::gather(processing, log2_abundance, -groupId, -sampleId) %>%
+  dplyr::filter(log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::group_by(processing, groupId) %>%
+  dplyr::filter(n() > 2) %>%
+  dplyr::summarize(
+    sample_mean = mean(log2_abundance),
+    sample_sd = sd(log2_abundance),
+    .groups = "drop"
+    ) %>%
+  dplyr::ungroup()
+
+# Total sum of squares of a processing method for each dataset
+posctl_processing_summary <- posctl_summary %>%
+  dplyr::group_by(processing) %>%
+  dplyr::summarize(posctl_RMSE = sqrt(sum(posctl_sd^2)/n()), posctl_N = n())
+
+sample_processing_summary <- sample_summary %>%
+  dplyr::group_by(processing) %>%
+  dplyr::summarize(sample_RMSE = sqrt(sum(sample_sd^2)/n()))
+
+posctl_processing_summary %>%
+  dplyr::left_join(sample_processing_summary, by = "processing") %>%
+  dplyr::filter(processing != ".loess_fit") %>%
+  ggplot(aes(x = posctl_RMSE, y = sample_RMSE, label = processing)) +
+  geom_point() +
+  ggrepel::geom_label_repel() +
+  theme_bw()
+```
+
+#### Sample abundances across normalization schemes
+
+```{r all_normalizations_plot, fig.height = 15, fig.width = 15}
+set.seed(1234)
+
+sample_peaks <- normalized_peaks %>%
+  romic::filter_tomic("category", "samples", c("sample", "posctl"),  "sample_type")
+  
+group_subset <- sample_peaks$features %>%
+  dplyr::sample_n(5)
+
+normalized_measurements <- sample_peaks$measurements %>%
+  dplyr::semi_join(group_subset, by = "groupId") %>%
+  dplyr::left_join(sample_peaks$samples %>% dplyr::select(sampleId, unique_batch, sample_type), by = "sampleId")
+  
+if ("centered_log2_abundance" %in% colnames(normalized_measurements)) {
+  normalized_measurements <- normalized_measurements %>%
+    dplyr::select(-centered_log2_abundance)
+}
+  
+
+normalized_measurements %>%
+  dplyr::select(!!!rlang::syms(setdiff(colnames(normalized_measurements), ".loess_fit"))) %>%
+  tidyr::gather(processing, abundance, -groupId, -sampleId, -sample_type, -unique_batch) %>%
+  dplyr::mutate(
+    sample_normalization = dplyr::case_when(
+      stringr::str_detect(processing, 'loading') ~ "loading adj",
+      TRUE ~ "raw"
+      ),
+    feature_normalization = dplyr::case_when(
+      stringr::str_detect(processing, 'b_centered') ~ "batch centered",
+      stringr::str_detect(processing, 'b_reference') ~ "batch reference",
+      stringr::str_detect(processing, 'loess') ~ "loess reference",
+      TRUE ~ "raw"
+      )) %>%
+  ggplot(aes(x = unique_batch, y = abundance, color = sample_type)) +
+  ggbeeswarm::geom_beeswarm() +
+  facet_grid(groupId ~ sample_normalization + feature_normalization, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+# Reduce to final outputs
+
+## Filter final samples based on the acceptible level of noise
+
+```{r filter_to_viable_peakgroups}
+# choose final normalization
+# choose normalized measure based on params$normalization_var
+  
+normalization_selected_measurements <- normalized_peaks$measurements %>%
+  # choose normalized measure based on params$normalization_var
+  dplyr::mutate(normalized_log2_abundance = !!rlang::sym(params$normalization_var))
+
+normalized_peaks <- romic::update_tomic(normalized_peaks, normalization_selected_measurements)
+
+valid_mzroll_list <- romic::update_tomic(
+  normalized_peaks,
+  normalized_peaks$measurements %>%
+    dplyr::select(groupId, sampleId, log2_abundance, normalized_log2_abundance)
+)
+  
+# sd within positive controls and within samples
+sample_type_measures <- valid_mzroll_list$measurements %>%
+  dplyr::filter(normalized_log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::left_join(
+    valid_mzroll_list$samples %>%
+      dplyr::select(sampleId, sample_type),
+    by = "sampleId"
+    ) %>%
+  dplyr::group_by(groupId, sample_type) %>%
+  dplyr::summarize(
+    sd = sd(normalized_log2_abundance),
+    N = n(),
+    .groups = "drop"
+    ) %>%
+  dplyr::ungroup() %>%
+  tidyr::gather(measure, value, -groupId, -sample_type) %>%
+  tidyr::unite(sample_type, measure, col = "measure") %>%
+  tidyr::spread(measure, value)
+
+valid_peaks <- sample_type_measures %>%
+  dplyr::filter(
+    !is.na(posctl_sd),
+    !is.na(sample_sd),
+    posctl_sd < 1.2,
+    sample_sd > posctl_sd * 1.1
+    )
+                
+retained_groupIds <- c(
+    as.character(valid_peaks$groupId),
+    as.character(manually_annotated_pgs$groupId)
+  ) %>%
+  unique() %>%
+  factor(levels = levels(valid_mzroll_list$features$groupId))
+
+valid_mzroll_list <- valid_mzroll_list %>%
+  claman::filter_groupIds(retained_groupIds)
+
+# final cleanup of some labels
+
+valid_mzroll_list$features <- valid_mzroll_list$features %>%
+  dplyr::mutate(peak_label = ifelse(
+    stringr::str_detect(peak_label, "unk_"),
+    stringr::str_replace(peak_label, "\\([0-9]\\)", ""),
+    peak_label
+    ))
+```
+
+### Write dataset containing normalized and unnormalized peak abundances
+
+```{r write_output}
+bio_small_molecules <- claman::filter_groupIds(small_molecules, bio_peaks$groupId) 
+
+# all biologially entriched peakgroups including blanks, negctls, ...
+saveRDS(bio_small_molecules, file = file.path(params$run_outdir, "out_files", "small_molecules.Rds"))
+# all reduced biological samples and biologically enriched peakgroups
+saveRDS(normalized_peaks, file = file.path(params$run_outdir, "out_files", "normalized_small_molecules.Rds"))
+# final reduced biological samples and valid peakgroups
+saveRDS(valid_mzroll_list, file = file.path(params$run_outdir, "out_files", "valid_small_molecules.Rds"))
+```
+

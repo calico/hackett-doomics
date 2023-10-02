@@ -21,6 +21,6 @@ Analyses are divided into two major phases:
 
 ## Dev Zone [meant for the studies authors]
 
-
+Set the following environmental variables.
 
 

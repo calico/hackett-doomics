@@ -1,0 +1,343 @@
+---
+title: "Setup Shiny Assets"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r globals}
+params <- list(
+  project_path = Sys.getenv("doomics_zfs_root"),
+  repo_path = Sys.getenv("doomics_repo_path"),
+  do_drive_token = Sys.getenv("doomics_drive_working_uri"),
+  shock_token = Sys.getenv("doomics_shock_token"),
+  out_base_dir = Sys.getenv("out_base_dir")
+)
+
+calibase::configure_google_access()
+
+source(file.path(params$repo_path, "utils", "data_prep.R"))
+#source(file.path(params$repo_path, "utils", "support_fxns.R"))
+source(file.path(params$repo_path, "3_interactive", "results_browser", "interactive.R"))
+
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggplot2))
+```
+
+```{r load_regression_outputs}
+diffex_outdir <- file.path(params$project_path, params$out_base_dir, "differential_abundances")
+
+lm_models <- readRDS(file = file.path(diffex_outdir, "out_files", "lm_models.Rds"))
+lm_params <- readRDS(file = file.path(diffex_outdir, "out_files", "target_model_parameters.Rds"))
+model_signif_raw <- readRDS(file = file.path(diffex_outdir, "out_files", "model_significance.Rds"))
+
+model_summaries <- lm_models %>%
+  tidyr::unnest(model_summary)
+```
+
+```{r load_data}
+wide_age_based_phenotypes <- load_wide_age_based_phenotypes(params$shock_token)
+
+feature_design_list <- construct_features_with_design(params, met_input = "valid") 
+# apply feature filters applied during regression modeling
+# basically removing a handful of identical features
+feature_design_list$features_with_design <- feature_design_list$features_with_design %>%
+  semi_join(model_signif_raw, by = c("data_type", "groupId"))
+
+# write each value of list to variables
+features_with_design <- feature_design_list$features_with_design %>%
+  # add additional sample features
+  dplyr::left_join(wide_age_based_phenotypes, by = c("Mouse.ID", Age = "blood_draw_age_coarse", "Generation")) %>%
+  dplyr::select(-sampleId)
+
+feature_attributes <- dplyr::bind_rows(
+  feature_design_list$proteomics_features,
+  feature_design_list$small_molecules_features,
+  feature_design_list$peptidomics_features %>%
+    dplyr::mutate(data_type = "peptides",
+                  NameUnique = PeptideSequence),
+  feature_design_list$olink_features %>%
+    dplyr::mutate(data_type = "olink",
+                  NameUnique = Assay,
+                  GeneName = NameUnique
+                  )
+  ) %>%
+  dplyr::mutate(feature_name = dplyr::case_when(!is.na(compoundName) ~ compoundName,
+                                                !is.na(NameUnique) ~ NameUnique)) %>%
+  dplyr::select(data_type, groupId, feature_name, gene = GeneName, is_unknown) %>%
+  dplyr::mutate(is_unknown = ifelse(is.na(is_unknown), FALSE, is_unknown)) %>%
+  dplyr::group_by(feature_name) %>%
+  dplyr::mutate(entry = 1:n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    feature_name = dplyr::case_when(
+      entry == 1 ~ feature_name,
+      TRUE ~ as.character(glue::glue("{feature_name} ({entry})"))
+    )
+  ) %>%
+  dplyr::select(-entry)
+
+# check that features and attributes match
+missing_attributes <- features_with_design %>%
+  dplyr::distinct(data_type, groupId) %>%
+  dplyr::anti_join(feature_attributes, by = c("data_type", "groupId"))
+
+if (nrow(missing_attributes) != 0) {
+  missing_attributes %>%
+  glue::glue_data("No attributes for {data_type}, groupId: {groupId}. ") %>%
+  stop()
+}
+
+unmatched_features <- features_with_design %>%
+  dplyr::distinct(data_type, groupId) %>%
+  dplyr::anti_join(feature_attributes, by = c("data_type", "groupId"))
+if (nrow(unmatched_features) != 0) {
+  stop("Some features did not have matching attributes")
+}
+```
+
+```{r read_other_summaries}
+model_signif <- model_signif_raw %>%
+  dplyr::mutate(plotting_priority = dplyr::case_when(
+    stringr::str_detect(groupName, "unk") ~ "unknown",
+    TRUE ~ "identified feature"),
+    plotting_priority = factor(plotting_priority, levels = c("identified feature", "unknown"))) %>%
+  dplyr::inner_join(
+    feature_attributes %>% dplyr::select(data_type, groupId, feature_name),
+    by = c("data_type", "groupId")
+  )
+
+features_with_design <- features_with_design %>%
+  # add data modality
+  dplyr::inner_join(
+    model_signif %>%
+      dplyr::distinct(data_modality, data_type),
+    by = "data_type"
+    ) %>%
+  dplyr::relocate(data_modality, .after = dataset)
+
+check_regression_summaries(
+  features_with_design,
+  lm_models,
+  lm_params,
+  model_signif,
+  model_summaries
+)
+```
+
+
+```{r correcting_batch_effects}
+# project out nuisance variation and cluster features
+
+# pull out estimates of cross-sectional (xs) batch effects
+# summarize early G8 and LBD batch effects for each feature
+batch_adjustments <- lm_models %>%
+  dplyr::filter(model_name == "cross-sectional lm (age + lifespan), no DDM") %>%
+  dplyr::select(-fits, -model_name) %>%
+  tidyr::unnest(params) %>%
+  dplyr::filter(term %in% c("early G8", "late blood draw")) %>%
+  dplyr::select(data_type, groupId, term, estimate) %>%
+  tidyr::spread(term, estimate) %>%
+  dplyr::rename(EG8 = `early G8`, LBD = `late blood draw`) %>%
+  dplyr::mutate(Ref = 0) %>%
+  tidyr::gather(xs_batch, xs_batch_adj, -data_type, -groupId) %>%
+  dplyr::mutate(xs_batch = factor(xs_batch, levels = levels(features_with_design$xs_batch)))
+
+projected_features_with_design <- features_with_design %>%
+  # add feature attributes
+  dplyr::left_join(feature_attributes, by = c("data_type", "groupId")) %>%
+  # add batch ajustments
+  dplyr::left_join(batch_adjustments, by = c("data_type", "groupId", "xs_batch")) %>%
+  dplyr::mutate(corrected_log2_abundance = normalized_log2_abundance - xs_batch_adj) %>%
+  # recalculate initial abundances and fold-changes
+  dplyr::group_by(dataset, groupId, Mouse.ID) %>%
+  dplyr::mutate(corrected_initial_abundance = ifelse("8 months" %in% Age, corrected_log2_abundance[Age == "8 months"], NA_real_)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(corrected_log2_fold_change = corrected_log2_abundance - corrected_initial_abundance) %>%
+  dplyr::select(-xs_batch_adj)
+```
+
+```{r clustering}
+# also remove sex effects then cluster features into K clusters
+
+sex_effects <- lm_models %>%
+  dplyr::filter(model_name == "cross-sectional lm (age + lifespan), no DDM") %>%
+  dplyr::select(-fits, -model_name) %>%
+  tidyr::unnest(params) %>%
+  dplyr::filter(term == "sex") %>%
+  dplyr::select(data_type, groupId, sex_effect = estimate)
+
+sex_controlled_projection <- projected_features_with_design %>%
+  dplyr::left_join(sex_effects, by = c("data_type", "groupId")) %>%
+  dplyr::mutate(sex_controlled_abundance = corrected_log2_abundance - as.integer(Sex)*sex_effect) %>%
+  # drop DDM
+  dplyr::filter(!is_ddm_sample) %>%
+  dplyr::filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics")) %>%
+  # center each feature
+  dplyr::group_by(feature_name) %>%
+  dplyr::mutate(sex_controlled_abundance = sex_controlled_abundance - mean(sex_controlled_abundance, na.rm = TRUE)) %>%
+  dplyr::ungroup()
+  
+# k-means clustering with Gaussian Mixture Models
+
+gmm_df <- sex_controlled_projection %>%
+  dplyr::select(
+    sample = feature_name, # we're clustering features
+    feature = unique_sample_id,
+    observation = sex_controlled_abundance
+    )
+
+gmm_clusters_cache_path <- file.path(Sys.getenv("scratch_dir"), "gmm_clusters.Rds")
+if (file.exists(gmm_clusters_cache_path)) {
+  gmm_clusters <- readRDS(gmm_clusters_cache_path)
+} else {
+  
+  gmm_clusters <- calicostats::k_clustering(
+    gmm_df,
+    k_vals = seq(2, 30, by = 2),
+    method = "gaussian_mixture_EM",
+    n_initializations = 5L,
+    return_plot = TRUE,
+    noise_type = "constant"
+    )
+
+  saveRDS(gmm_clusters, gmm_clusters_cache_path)
+}
+
+best_clusters <- gmm_clusters$cluster_fit %>%
+  dplyr::filter(k == 20) %>%
+  dplyr::select(-logLik) %>%
+  tidyr::unnest_wider(cluster)
+
+feature_clusters <- best_clusters$membership[[1]] %>%
+  dplyr::arrange(desc(responsibility)) %>%
+  dplyr::group_by(sample) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()  %>%
+  dplyr::select(feature_name = sample, cluster) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = sort(unique(cluster))))
+```
+
+```{r romic_formatting}
+tidy_features <- projected_features_with_design %>%
+  dplyr::semi_join(features_with_design %>%
+                     dplyr::count(data_type, groupId) %>%
+                     dplyr::filter(n >= (max(n)/4)),
+                   by = c("data_type", "groupId")) %>%
+  # add clusters
+  dplyr::left_join(feature_clusters, by = "feature_name") %>%
+  dplyr::mutate(
+    cluster = ifelse(is.na(cluster), -1, cluster),
+    cluster = factor(cluster, levels = sort(unique(cluster)))
+    ) %>%
+  # add general features
+  romic::create_tidy_omic(feature_pk = "feature_name",
+                          feature_vars = c("data_type", "data_modality", "groupId", "gene", "is_unknown", "cluster"),
+                          sample_pk = "unique_sample_id",
+                          sample_vars = c("set", "sample", "Mouse.ID", "blood_draw_age_actual",
+                                          "Age", "Sex", "lifespan", "lifespan_remaining", "fraction_of_life_lived", "is_ddm_sample",
+                                          "is_lbd_sample", "is_eg8_sample", "is_eg8_fc_sample", "xs_batch", "fc_batch",
+                                          "Generation", "alb", "bun", "bw", "cr", "gluc", "igf1", "phos",
+                                          "potas", "sodium", "Birth_date", "Draw_date", "death_ES", "death_FD")) %>%
+  romic::center_tomic(c("corrected_log2_abundance", "normalized_log2_abundance"))
+```
+
+```{r interactive_viz}
+if (interactive()) {
+  library(shiny)
+
+  # interactive heatmap
+  tidy_features %>%
+    romic::filter_tomic(
+      filter_type = "category",
+      filter_table = "features",
+      filter_variable = "data_type",
+      c("lipids-neg", "lipids-pos", "metabolites-neg", "metabolites-pos", "olink", "tryptic-compms")
+    ) %>%
+    romic::app_heatmap()
+  
+  # interactive coloring of PCs
+  romic::app_pcs(tidy_features)
+}
+```
+
+```{r upload_gcp_assets}
+shiny_assets_dir <- file.path(params$project_path, "shiny_assets")
+if (!dir.exists(shiny_assets_dir)) {
+  dir.create(shiny_assets_dir)
+}
+
+saveRDS(feature_design_list, file.path(shiny_assets_dir, "feature_design_list.Rds"))
+saveRDS(model_signif, file.path(shiny_assets_dir, "model_signif.Rds"))
+saveRDS(lm_models, file.path(shiny_assets_dir, "lm_models.Rds"))
+file.copy(
+  file.path(diffex_outdir, "out_files", "all_model_signif.Rds"),
+  file.path(shiny_assets_dir, "all_model_signif.Rds"),
+  overwrite = TRUE
+)
+
+projected_features_with_design %>%
+  dplyr::left_join(feature_clusters, by = "feature_name") %>%
+  dplyr::mutate(
+    cluster = ifelse(is.na(cluster), -1, cluster),
+    cluster = factor(cluster, levels = sort(unique(cluster)))
+    ) %>%
+  saveRDS(file.path(shiny_assets_dir, "features_with_design.Rds"))
+
+saveRDS(tidy_features, file.path(shiny_assets_dir, "tidy_features.Rds"))
+
+tidy_features %>%
+    romic::filter_tomic(
+      filter_type = "category",
+      filter_table = "features",
+      filter_variable = "data_type",
+      c("lipids-neg", "lipids-pos", "metabolites-neg", "metabolites-pos", "olink", "tryptic-compms")
+    ) %>%
+  saveRDS(file.path(shiny_assets_dir, "tidy_features_no_peptides.Rds"))
+
+tidy_features %>%
+    romic::filter_tomic(
+      filter_type = "category",
+      filter_table = "features",
+      filter_variable = "data_type",
+      c("peptides")
+    ) %>%
+  saveRDS(file.path(shiny_assets_dir, "tidy_features_peptides.Rds"))
+
+# move informatics outputs
+
+informatics_assets_dir <- file.path(shiny_assets_dir, "informatics")
+if (!dir.exists(informatics_assets_dir)) {
+  dir.create(informatics_assets_dir)
+}
+
+R.utils::copyDirectory(
+  from = file.path(params$project_path, "data", "proteomics"),
+  to = file.path(informatics_assets_dir, "proteomics")
+)
+
+R.utils::copyDirectory(
+  from = file.path(params$project_path, out_base_dir$out_base_dir),
+  to = file.path(informatics_assets_dir, "metabolites_lipids")
+)
+
+R.utils::removeDirectory(
+  file.path(informatics_assets_dir, "metabolites_lipids", "differential_abundances", "out_files", "bootstrap_results"),
+  recursive = TRUE
+)
+
+# add to GCS
+```

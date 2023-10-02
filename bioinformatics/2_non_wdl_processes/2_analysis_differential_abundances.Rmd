@@ -1,0 +1,517 @@
+---
+title: "DO Differential Abundance Testing"
+author: "Shackett, mmagzoub"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+params <- list(
+  project_path = Sys.getenv("doomics_zfs_root"),
+  repo_path = Sys.getenv("doomics_repo_path"),
+  do_drive_token = Sys.getenv("doomics_drive_working_uri"),
+  run_outdir = file.path(Sys.getenv("doomics_zfs_root"), "data", "proteomics")
+)
+
+run_outdir <- file.path(params$project_path, params$out_base_dir, "differential_abundances")
+
+knitr::opts_chunk$set(
+  fig.path = file.path(run_outdir, "out_figures/"),
+  out.width='2000px',
+  dpi = 200
+)
+```
+
+
+```{r package_loading, message = FALSE, warning = FALSE}
+library(tidyverse)
+
+calibase::configure_google_access()
+
+source(file.path(params$repo_path, "utils", "data_prep.R"))
+source(file.path(params$repo_path, "utils", "linear_model_fxns.R"))
+source(file.path(params$repo_path, "utils", "support_fxns.R"))
+
+if (!file.exists(run_outdir)) {
+  dir.create(run_outdir)
+  dir.create(file.path(run_outdir, "out_files"))
+  dir.create(file.path(run_outdir, "out_figures"))
+  }
+
+knitr::kable(tibble::tibble(parameters = names(params),
+                            values = unname(unlist(params))))
+```
+
+# Load multiomic data (soluble metabolites, lipids, proteins)
+
+```{r load_omics}
+set.seed(1234)
+feature_design_list <- construct_features_with_design(params, met_input = "valid")
+```
+
+## Remove Identical Features
+
+```{r remove_identical_features}
+feature_matrix <- feature_design_list$features_with_design %>%
+  reshape2::acast(data_type + groupId ~ unique_sample_id, value.var = "normalized_log2_abundance")
+
+# find identical features - based on correlation > 0.995
+identical_features <- cor(t(feature_matrix), use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(feature_2 = row.names(.)) %>%
+  as_tibble() %>%
+  gather(feature_1, corr, -feature_2) %>%
+  filter(feature_2 != feature_1) %>%
+  filter(abs(corr) > 0.995) %>%
+  # keep just one feature of a feature_1/2 pair
+  dplyr::filter(feature_1 < feature_2) %>%
+  # convert feature labels back to data_type + groupId tuples
+  tidyr::separate(
+    feature_2,
+    into = c("feature_2_data_type", "feature_2_groupId"),
+    sep = "_") %>%
+  tidyr::separate(
+    feature_1,
+    into = c("feature_1_data_type", "feature_1_groupId"),
+    sep = "_") %>%
+  mutate(
+    feature_1_groupId = as.integer(feature_1_groupId),
+    feature_2_groupId = as.integer(feature_2_groupId)
+    )
+  
+# check that only metabolites and lipids are present
+# currently this is true and additional logic for filtering
+# features would need to be implemented if this changed
+stopifnot(
+  nrow(identical_features) != 0,
+  all(identical_features$feature_1_data_type %in% c("lipids-pos", "lipids-neg", "metabolites-pos", "metabolites-neg")),
+  all(identical_features$feature_1_data_type == identical_features$feature_2_data_type)
+)
+
+# retain just one entry
+# i guess you can filter by alphabetical order - useful but a little scary
+  
+# retain just one entry
+# i guess you can filter by alphabetical order - useful but a little scary
+  
+identical_features_w_attrs <- identical_features %>%
+  left_join(
+    feature_design_list$small_molecules_features %>%
+      dplyr::select(feature_1_data_type = data_type, feature_1_groupId = groupId, feature_1_compoundName = compoundName, feature_1_searchTableName = searchTableName),
+    by = c("feature_1_data_type", "feature_1_groupId")) %>%
+  left_join(
+    feature_design_list$small_molecules_features %>%
+      dplyr::select(feature_2_data_type = data_type, feature_2_groupId = groupId, feature_2_compoundName = compoundName, feature_2_searchTableName = searchTableName),
+    by = c("feature_2_data_type", "feature_2_groupId")) %>%
+  # prioritize which feature to retain to retain knowns over unknowns and
+  # to merge isomers
+  dplyr::mutate(action = dplyr::case_when(
+    feature_1_searchTableName %in% c("peakdetector", "rumsDB") & feature_2_searchTableName %in% c("Bookmarks", "EICs") ~ "keep feature_2",
+    feature_2_searchTableName %in% c("peakdetector", "rumsDB") & feature_1_searchTableName %in% c("Bookmarks", "EICs") ~ "keep feature_1",
+    feature_1_searchTableName %in% c("Bookmarks", "EICs") & feature_2_searchTableName %in% c("Bookmarks", "EICs") ~ "merge",
+    feature_1_searchTableName %in% "rumsDB" & feature_2_searchTableName %in% "peakdetector" ~ "keep feature_2",
+    feature_2_searchTableName %in% "rumsDB" & feature_1_searchTableName %in% "peakdetector" ~ "keep feature_1",
+    TRUE ~ NA
+  ))
+# check that all cases were covered
+stopifnot(all(!is.na(identical_features_w_attrs$action)))
+
+merged_features <- identical_features_w_attrs %>%
+  dplyr::filter(action == "merge") %>%
+  rowwise() %>%
+  dplyr::mutate(
+    updated_name = dplyr::case_when(
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(-) Isocitric acid", "(-) Citric acid")) ~ "(-) (Iso)citric acid",
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(-) PC(16:0/17:1)", "(-) PC(15:0/18:1)")) ~ "(-) PC(15:0/18:1) and PC(16:0/17:1)",
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(-) PC(18:0/20:5)", "(-) PC(20:5/18:0)")) ~ "(-) PC(18:0_20:5)",
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(-) L-Lactic acid", "(-) Glyceraldehyde")) ~ "(-) L-Lactic acid and Glyceraldehyde",
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(-) Adipic acid", "(-) 2-Methylglutaric acid")) ~ "(-) Adipic acid and 2-Methylglutaric acid",
+      all(c(feature_1_compoundName, feature_2_compoundName) %in% c("(+) 4-Hydroxyproline", "(+) 5-Aminolevulinic acid")) ~ "(+) 4-Hydroxyproline and 5-Aminolevulinic acid",
+      TRUE ~ NA
+    ),
+    # create a label without the mode
+    updated_label = stringr::str_replace(updated_name, "^\\([+-]\\) ", "")
+  )
+# check that all cases where covered
+stopifnot(all(!is.na(merged_features$updated_name)))
+
+discarded_peakgroups <- dplyr::bind_rows(
+  identical_features_w_attrs %>%
+    dplyr::filter(action %in% c("merge", "keep feature_1")) %>%
+    dplyr::select(data_type = feature_2_data_type, groupId = feature_2_groupId, compoundName = feature_2_compoundName),
+  identical_features_w_attrs %>%
+    dplyr::filter(action == "keep feature_2") %>%
+    dplyr::select(data_type = feature_1_data_type, groupId = feature_1_groupId, compoundName = feature_1_compoundName)
+)
+
+# update small_molecules_features
+feature_design_list$small_molecules_features <- feature_design_list$small_molecules_features %>%
+  anti_join(discarded_peakgroups, by = c("data_type", "groupId")) %>%
+  dplyr::left_join(merged_features %>% dplyr::select(feature_1_data_type, feature_1_groupId, updated_name, updated_label), by = c("data_type" = "feature_1_data_type", "groupId" = "feature_1_groupId")) %>%
+  # overwrite names with merges
+  dplyr::mutate(
+    compoundName = ifelse(!is.na(updated_name), updated_name, compoundName),
+    peak_label = ifelse(!is.na(updated_label), updated_label, peak_label)
+  ) %>%
+  dplyr::select(-updated_name, -updated_label)
+  
+# update features_with_design
+features_with_design <- feature_design_list$features_with_design %>%
+  dplyr::anti_join(discarded_peakgroups, by = c("data_type", "groupId"))
+feature_design_list$features_with_design <- features_with_design
+
+# save model_data with identical compounds merged or removed
+saveRDS(feature_design_list, file = file.path(run_outdir, "out_files", "feature_design_list.Rds"))
+saveRDS(features_with_design, file = file.path(run_outdir, "out_files", "model_data.Rds"))
+```
+
+# Hypothesis testing
+
+## ANOVA of sex, mouse, age and lifespan at blood draw for peaks enriched in biological samples
+
+To test for the effects of primary variables on the abundance of each specie, we fit an ordinary least squares model separately to each species. In this OLS regression it is clear that there are large effects of all primary variables. The effect for lifespan is primarily driven by measurements of near-death individuals in the final age point. To mask this effect and test for more general longevity association, I filtered the final timepoint for mice that lived less than 700 days and calculated associations where the death door metabolite (DDM) signature was removed.
+
+```{r lm_fitting, message = FALSE, warning = FALSE}
+setup_data_path <- file.path(run_outdir, 'out_files', 'lm_setup_data.Rds')
+bootstraps_dir <- file.path(run_outdir, 'out_files', 'bootstrap_results')
+models_path <- file.path(run_outdir, 'out_files', 'lm_models.Rds')
+
+overwrite <- FALSE
+n_jobs <- 200
+n_bootstraps <- 1e6
+#n_bootstraps <- 1e5
+
+out_files <- tibble::tibble(job_id = 1:n_jobs) %>%
+  dplyr::mutate(
+    out_file = glue::glue("fit_lms_job{job_id}_bs{n_bootstraps}.Rds"),
+    out_path = file.path(bootstraps_dir, out_file),
+    exists = file.exists(out_path)
+  )
+  
+if (all(out_files$exists) && !overwrite){
+  
+  lm_models <- out_files %>%
+    dplyr::mutate(dat = purrr::map(out_path, readRDS)) %>%
+    {dplyr::bind_rows(.$dat)}
+  
+  saveRDS(lm_models, models_path)
+  
+} else if (any(out_files$exists) && !overwrite) {
+  stop ("A subset of bootstrap outfiles exist, check the output of \"out_files\"")
+} else {
+  
+  out_files %>%
+    dplyr::filter(exists) %>%
+    {purrr::walk(.$out_path, file.remove)}
+  
+  # assign features to a job ID
+  feature_job_assignments <- features_with_design %>%
+    dplyr::distinct(data_type, groupId) %>%
+    # shuffle rows
+    dplyr::slice(sample(1:dplyr::n())) %>%
+    # assign features to jobs
+    dplyr::mutate(job_id = 1:dplyr::n() %% n_jobs + 1)
+  
+  lm_setup_data <- features_with_design %>%
+    dplyr::left_join(feature_job_assignments, by = c("data_type", "groupId")) %>%
+    tidyr::nest(model_data = -c(data_type, job_id)) %>%
+    tidyr::crossing(do_linear_models)
+  
+  saveRDS(lm_setup_data, setup_data_path)
+  
+  stop(glue::glue("Call \"sbatch --array=1-{n_jobs} {repo_path}/bioinformatics/utils/bootstrapping/bootstrap.sh {format(n_bootstraps, scientific=FALSE)}\" on cb2"))
+}
+
+lm_params <- lm_models %>%
+  dplyr::select(-fits, -job_id, -model_summary) %>%
+  tidyr::unnest(params)
+
+lm_params %>%
+  dplyr::group_by(model_name, term) %>%
+  dplyr::slice(1)
+```
+
+```{r model_glances}
+model_summaries <- lm_models %>%
+  unnest(model_summary)
+```
+
+```{r}
+ggplot(lm_params, aes(x = pmin(-log10(pvalue_ols), 6), y = -log10(pvalue_bs))) +
+  geom_hex() +
+  scale_fill_gradientn(colors = c("gray80", "gray50", "orange", "firebrick"), trans = "log10", breaks = 10^(0:5)) +
+  theme_bw() +
+  geom_abline(slope = 1) +
+  scale_x_continuous(expression(-log[10] ~ "p-value (OLS)")) +
+  scale_y_continuous(expression(-log[10] ~ "p-value (bootstrapped)"))
+```
+
+# Results
+
+## Summary of overall importance of effects
+
+### Overall significance of effects
+
+Enrichment of small p-values is a quick view at the amount of signal of each type of fit parameter for different datasets
+
+```{r all_coefs, fig.height = 20, fig.width = 20}
+# some lipids unknowns which showed preliminary associations in set12 were
+# peak picked as unknowns across set12 + set3
+# due to ascertainment bias we should only interpret these features as suggestive
+# and we shouldn't apply FDR control to them 
+  
+stat_contaminated_features <- feature_design_list$small_molecules_features %>%
+  dplyr::filter(data_type == "lipids-neg", stringr::str_detect(compoundName, "unk_"))
+
+#target_model_parameters %>%
+#  dplyr::inner_join(stat_contaminated_features, by = c("data_type", "groupId")) %>%
+#  readr::write_tsv("~/do_neg_lipid_unknowns.tsv")
+
+# Combine coefficients and significance for all models fit
+
+lm_params_nobias <- lm_params %>%
+  dplyr::anti_join(stat_contaminated_features, by = c("data_type", "groupId"))
+  
+# look at all distributions to check for pathologies
+# use "pals" colorbar since there are too many models for the standard color palettes
+lm_params_nobias %>%
+  ggplot(aes(x = pvalue_bs, fill = model_name)) +
+  geom_histogram(bins = 50, position = "stack") +
+  #geom_density(bw = 0.01, alpha = 0.3) +
+  facet_grid(model_name ~ term, scale = "free_y") +
+  scale_fill_manual("Samples analyzed", values = unname(pals::alphabet(length(unique(lm_params_nobias$model_name))))) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 14),
+        axis.text.x = element_text(angle = 60, hjust = 1), 
+        strip.background = element_rect(fill = "gray90"),
+        strip.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 8),
+        panel.spacing = grid::unit(1, "lines"),
+        legend.text=element_text(size=8)) +
+  guides(fill=guide_legend(nrow=3, byrow=TRUE))
+```
+
+
+```{r selected_coefs, fig.height = 8, fig.width = 15}
+# select coefficients that each model was targeting to assess (some coefs
+# will serve as covariates in models where we are not assessing their
+# overall significance).
+
+target_terms <- do.call(dplyr::bind_rows,
+                        list(do_linear_models %>%
+                               tidyr::unnest(model_params) %>%
+                               dplyr::select(model_name, term) %>%
+                               tidyr::unnest(term)))
+
+target_model_parameters <- lm_params %>%
+  dplyr::semi_join(target_terms, by = c("model_name", "term"))
+target_model_parameters_nobias <- lm_params_nobias %>%
+  dplyr::semi_join(target_terms, by = c("model_name", "term"))
+
+ggplot(target_model_parameters_nobias, aes(x = pvalue_bs)) +
+  geom_histogram(bins = 100, position = "stack") +
+  facet_grid(data_type ~ term, scale = "free_y") +
+  scale_fill_brewer("Samples analyzed", palette = "Set1") +
+  theme_minimal() +
+  theme(legend.position = "bottom", text = element_text(size = 14),
+        axis.text.x = element_text(angle = 60, hjust = 1),
+        strip.background = element_rect(fill = "gray90"),
+        strip.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 8),
+        panel.spacing = grid::unit(1, "lines"))
+```
+
+### Summary of variable pi0 estimates
+
+If different types of measurements are impacted by the experimental variables to a similar degree then we will more realistically assess significance by pooling across all dataset.
+
+```{r pi0_estimation}
+find_dataset_pi0 <- function(data) {
+  qvalue::qvalue(data$pvalue_bs, lambda = seq(0.05, 0.85, 0.05))$pi0
+}
+
+pi0_estimates <- dplyr::bind_rows(
+  target_model_parameters_nobias %>%
+    tidyr::nest(data = -term) %>%
+    dplyr::mutate(data_type = "all_datasets"),
+  target_model_parameters_nobias %>%
+    dplyr::filter(!data_type %in% c("peptides", "olink")) %>%
+    tidyr::nest(data = -term) %>%
+    dplyr::mutate(data_type = "core"),
+  target_model_parameters_nobias %>%
+    tidyr::nest(data = -c(term, data_type))
+) %>%
+  dplyr::mutate(pi0 = purrr::map_dbl(data, find_dataset_pi0)) %>%
+  dplyr::select(-data)
+
+knitr::kable(pi0_estimates %>%
+               spread(data_type, pi0))
+```
+
+### Estimating discoveries at the desired FDR
+
+As seen above, pizero estimates are roughly similar across different data modalities suggesting each feature should use a shared pi0 estimate. While pi0 should be shared, we have different power to detect changes across data types (particularly for proteomics vs. non-proteomics). To balance these effects I used a global pi0 estimate across datasets but calculated q-values separately for each dataset.
+
+```{r qvalue_stratified_pi0}
+# calculate q-values on a dataset-by-dataset basis but using a global pi0
+global_pi0 <- pi0_estimates %>%
+  dplyr::filter(data_type == "core")
+
+# TODO: move q value calculation into linear_model_fxns.R
+calculate_qvalues <- function(data, pi0 = NULL) {
+  qvals <- qvalue::qvalue(data$pvalue_bs, lambda = seq(0.05, 0.85, 0.05))
+  
+  if (is.null(pi0)) {
+    data$q.value <- qvals$qvalues
+  } else {
+    data$q.value <- qvals$qvalues * pi0 / qvals$pi0
+  }
+  data
+}
+
+data_modalities <- target_model_parameters_nobias %>%
+  dplyr::distinct(data_type) %>%
+  dplyr::mutate(data_modality = dplyr::case_when(
+    stringr::str_detect(data_type, "metabolites") ~ "metabolomics",
+    stringr::str_detect(data_type, "lipids") ~ "lipidomics",
+    data_type == "tryptic-compms" ~ "proteomics",
+    data_type == "olink" ~ "olink",
+    data_type == "peptides" ~ "peptidomics"
+    ))
+
+if (any(is.na(data_modalities$data_modality))) {
+  stop (paste(data_modalities$data_type[is.na(data_modalities$data_modality)], collapse = ", "), " are an undefined data modalities")
+}
+
+model_signif <- target_model_parameters_nobias %>%
+  # group by molecule type
+  dplyr::left_join(data_modalities, by = "data_type") %>%
+  tidyr::nest(data = -c(term, data_modality)) %>%
+  dplyr::left_join(global_pi0 %>% dplyr::select(-data_type), by = "term") %>%
+  dplyr::mutate(model_signif = purrr::map(data, calculate_qvalues)) %>%
+  tidyr::unnest_legacy(model_signif)
+
+# add back features where FDR control was not applied
+
+model_signif <- dplyr::bind_rows(
+  model_signif,
+  lm_params %>%
+    dplyr::semi_join(stat_contaminated_features, by = c("data_type", "groupId")) %>%
+    dplyr::inner_join(data_modalities, by = "data_type") %>%
+    dplyr::semi_join(target_terms, by = c("model_name", "term"))
+)
+
+discoveries <- model_signif %>%
+  dplyr::group_by(data_modality, term) %>%
+  dplyr::summarize(`discoveries at q0.01` = sum(q.value < 0.01, na.rm = TRUE),
+                   `discoveries at q0.05` = sum(q.value < 0.05, na.rm = TRUE),
+                   `discoveries at q0.1` = sum(q.value < 0.1, na.rm = TRUE),
+                   .groups = "drop") %>%
+  dplyr::arrange(term, data_modality)
+
+DT::datatable(discoveries)
+```
+
+```{r volcano_plots, fig.width = 10, fig.height = 10}
+model_signif %>%
+  filter(!is.na(q.value)) %>%
+  dplyr::mutate(fdr_label = dplyr::case_when(q.value < 0.1 ~ "q < 0.1",
+                                             TRUE ~ "n.s.")) %>%
+  arrange(fdr_label) %>%
+  ggplot(aes(x = estimate, y = -log10(pvalue_bs), color = fdr_label)) +
+  geom_point() +
+  facet_wrap(~ term, scale = "free") +
+  scale_x_continuous("Coefficient") +
+  scale_color_manual("Significance", values = c( "q < 0.1" = "dodgerblue", "n.s." = "gray50")) +
+  theme_bw()
+```
+
+## Perform FDR control on all terms in addition to the selected ones
+
+```{r}
+all_pi0_estimates <- lm_params_nobias %>%
+    dplyr::filter(!data_type %in% c("peptides", "olink")) %>%
+    tidyr::nest(data = -c(model_name, term)) %>%
+  dplyr::mutate(pi0 = purrr::map_dbl(data, find_dataset_pi0)) %>%
+  dplyr::select(-data)
+
+all_model_signif <- lm_params_nobias %>%
+  # group by molecule type
+  dplyr::left_join(data_modalities, by = "data_type") %>%
+  tidyr::nest(data = -c(model_name, term, data_modality)) %>%
+  dplyr::left_join(all_pi0_estimates, by = c("model_name", "term")) %>%
+  dplyr::mutate(model_signif = purrr::map(data, calculate_qvalues)) %>%
+  tidyr::unnest_legacy(model_signif)
+
+stopifnot(nrow(all_model_signif) == nrow(lm_params_nobias))
+
+all_model_signif <- dplyr::bind_rows(
+  all_model_signif,
+  lm_params %>%
+    dplyr::semi_join(stat_contaminated_features, by = c("data_type", "groupId")) %>%
+    dplyr::inner_join(data_modalities, by = "data_type")
+)
+
+stopifnot(nrow(all_model_signif) == nrow(lm_params))
+```
+
+# Save Results
+
+### Write out model data and parameter significance
+
+```{r write_output}
+model_table <- dplyr::bind_rows(
+  # label metabolite data by compoundName
+  model_signif %>%
+    dplyr::filter(
+      stringr::str_detect(data_type, 'metabolites') |
+        stringr::str_detect(data_type, 'lipids')
+      ) %>%
+    dplyr::left_join(feature_design_list$small_molecules_features %>%
+                       dplyr::select(groupId, compoundName) %>%
+                       dplyr::distinct(), by = c('groupId')) %>%
+    dplyr::rename(groupName = compoundName),
+  # label protein data by gene name if available or uniprot id
+  model_signif %>% 
+    dplyr::filter(data_type == 'tryptic-compms') %>% 
+    dplyr::left_join(feature_design_list$proteomics_features %>%
+                       dplyr::mutate(groupName = ifelse(!is.na(GeneName), GeneName, NameUnique)) %>%
+                       dplyr::select(groupId, groupName), by = c('groupId')),
+  # label olink data by gene name
+  model_signif %>%
+    dplyr::filter(data_type == 'olink') %>%
+    dplyr::left_join(feature_design_list$olink_features %>%
+                dplyr::select(groupId, Assay), by = 'groupId') %>%
+    dplyr::rename(groupName = Assay),
+  # peptides
+  model_signif %>%
+    dplyr::filter(data_type == 'peptides') %>%
+    dplyr::left_join(
+      feature_design_list$peptidomics_features %>%
+        dplyr::mutate(name_w_gene = glue::glue("{GeneName} {NameUnique}")) %>%
+        dplyr::select(groupId, name_w_gene),
+      by = 'groupId') %>%
+    dplyr::rename(groupName = name_w_gene)
+)
+
+check_regression_summaries(
+  features_with_design,
+  lm_models,
+  lm_params,
+  model_signif,
+  model_summaries
+)
+
+# lm_models were already saved above
+saveRDS(model_table, file = file.path(run_outdir, "out_files", "model_significance.Rds"))
+saveRDS(target_model_parameters, file = file.path(run_outdir, "out_files", "target_model_parameters.Rds"))
+saveRDS(all_model_signif, file = file.path(run_outdir, "out_files", "all_model_signif.Rds"))
+
+readr::write_tsv(target_model_parameters, file = file.path(run_outdir, "out_files", "target_model_parameters.tsv"))
+```
