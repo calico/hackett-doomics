@@ -15,6 +15,10 @@ params:
   annotation_data_type: "metabolomics-pos"
   n_slurm_jobs: "50"
   log2_limit: 12.0
+  project_path: ""
+  repo_path: ""
+  do_drive_token: ""
+  shock_token: ""
 tags:
 - "diversity outcross"
 - "small molecules"
@@ -27,7 +31,7 @@ library(tidyverse)
 library(claman)
 
 updated_params <- append(
-  params,
+  params[params != ""],
   list(
     project_path = Sys.getenv("doomics_zfs_root"),
     do_drive_token = Sys.getenv("doomics_drive_working_uri"),

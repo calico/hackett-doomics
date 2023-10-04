@@ -57,7 +57,13 @@ upload_knitted_html <- function (out_dir, doc_name, connect_id = NULL) {
   if (length(out_htmls) == 1) {
     full_html_path <- file.path(out_dir, out_htmls)
     
-    clamshell::connect_deploy_doc(full_html_path, doc_name, appId = connect_id, forceUpdate = TRUE)
+    calibase::connect_deploy_doc(
+      full_html_path,
+      doc_name,
+      server = "public",
+      appId = connect_id,
+      forceUpdate = TRUE
+      )
   }
 }
 
@@ -136,7 +142,11 @@ if (script_mode == "featurization") {
   run_id = unname(selected_json_path["run_id"])
   data_type = unname(selected_json_path["featurization"])
   call_script <- featurization_scripts$script[featurization_scripts$data_type == data_type]
-  call_script_path <- file.path(do_config_json[["globals"]][["repo_path"]], "wdl_processes", call_script)
+  call_script_path <- file.path(
+    do_config_json[["globals"]][["repo_path"]],
+    "bioinformatics",
+    "1_wdl_processes",
+    call_script)
   
   # read run specs
   run_specs <- try(do_config_json[["featurization"]][[data_type]][[selected_json_path["datatype"]]][[selected_json_path["runspecs"]]], silent = TRUE)
@@ -175,7 +185,18 @@ if (script_mode == "featurization") {
                       output_dir = run_outdir,
                       params = rmd_paramers,
                       envir = new.env())
-  }
+    
+    
+    # upload rendered .html
+    doc_name = glue::glue("DO Mice : {run_id}")
+    if ("connect_id" %in% names(run_specs)) {
+      # provide a connect ID via the config to update an existing connect report
+      connect_id <- as.integer(unname(run_specs["connect_id"]))
+    } else {
+      connect_id <- NULL
+    }
+    upload_knitted_html(run_outdir, doc_name, connect_id = connect_id) 
+  }}
 
 # write mtcars if successful :)
 write.table(mtcars, file = "outputA.ext")
