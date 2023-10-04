@@ -1,11 +1,37 @@
 library(tidyverse)
 
+create_globals <- function () {
+  
+  # globals were previously defined in plasma_omics.wdl which is bad practice
+  # from a security point of view. Now, we'll pull these same variables out
+  # of environmental variables set in the .Renviron
+  
+  required_global_mapping <- tibble::tribble(
+    ~ global_var, ~ env_var_name,
+    "project_path", "doomics_zfs_root",
+    "repo_path", "doomics_repo_path",
+    "do_drive_token", "doomics_drive_working_uri",
+    "shock_token", "doomics_shock_token",
+    "out_base_dir", "doomics_out_base_dir"
+  )
+  
+  global_values <- required_global_mapping %>%
+    mutate(env_var = purrr::map_chr(env_var_name, Sys.getenv))
+  
+  stopifnot(all(global_values$env_var != ""))
+  
+  globals_list <- as.list(global_values$env_var)
+  names(globals_list) <-  required_global_mapping$global_var
+  
+  return(globals_list)
+}
+
 test_config_globals <- function(do_config_json) {
   
   stopifnot("globals" %in% names(do_config_json))
   defined_globals <- do_config_json[["globals"]]
   
-  required_globals <- c("project_path", "repo_path", "do_drive_token", "shock_token", "out_base_dir", "n_slurm_jobs")
+  required_globals <- c("project_path", "repo_path", "do_drive_token", "shock_token", "out_base_dir")
   missing_required_globals <- setdiff(required_globals, names(defined_globals))
   if (length(missing_required_globals) != 0) {
     stop ("missing required global params in json: ", paste(missing_required_globals, collapse = ", "))
@@ -80,6 +106,8 @@ if (length(missing_required_args) != 0) {
 # read json config and test globals
 
 do_config_json <- jsonlite::fromJSON(formatted_flags["path_do_config"])
+do_config_json$globals <- create_globals()
+
 test_config_globals(do_config_json)
 
 # What run mode are we in?
@@ -95,7 +123,7 @@ if (is.null(script_mode)) {
 }
 
 # select DO json path
-json_path_table_tsv <- readr::read_tsv(formatted_flags["json_path_table"])
+json_path_table_tsv <- readr::read_tsv(formatted_flags["json_path_table"], show_col_types = FALSE)
 if (!(formatted_flags["process_feature_id"] %in% json_path_table_tsv$run_id)) {
   stop ("No information for run_id: ", formatted_flags["process_feature_id"], " in featurization_table; valid IDs are: ", paste(json_path_table_tsv$run_id, collapse = ", ")) 
 }
@@ -147,18 +175,6 @@ if (script_mode == "featurization") {
                       output_dir = run_outdir,
                       params = rmd_paramers,
                       envir = new.env())
-    
-    # upload rendered .html
-    doc_name = glue::glue("DO Mice : {run_id}")
-    if ("connect_id" %in% names(run_specs)) {
-      # provide a connect ID via the config to update an existing connect report
-      connect_id <- as.integer(unname(run_specs["connect_id"]))
-    } else {
-      connect_id <- NULL
-    }
-    upload_knitted_html(run_outdir, doc_name, connect_id = connect_id) 
-    
-    }
   }
 
 # write mtcars if successful :)

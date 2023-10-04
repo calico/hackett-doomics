@@ -14,6 +14,7 @@ params:
   run_outdir: "/tmp/featurization.metabolomics"
   annotation_data_type: "metabolomics-pos"
   n_slurm_jobs: "50"
+  log2_limit: 12.0
 tags:
 - "diversity outcross"
 - "small molecules"
@@ -25,30 +26,32 @@ tags:
 library(tidyverse)
 library(claman)
 
-params <- list(
-  project_path = Sys.getenv("doomics_zfs_root"),
-  do_drive_token = Sys.genev("doomics_drive_working_uri"),
-  repo_path = Sys.getenv("doomics_repo_path")
-)
+updated_params <- append(
+  params,
+  list(
+    project_path = Sys.getenv("doomics_zfs_root"),
+    do_drive_token = Sys.getenv("doomics_drive_working_uri"),
+    repo_path = Sys.getenv("doomics_repo_path")
+    )
+  )
+  
+source(file.path(updated_params$repo_path, "bioinformatics", "utils", "data_prep.R"))
 
-source(file.path(params$repo_path, "utils", "data_prep.R"))
-source(file.path(params$repo_path, "utils", "support_fxns.R"))
-
-if (!file.exists(params$run_outdir)) {
-  dir.create(params$run_outdir)
+if (!file.exists(updated_params$run_outdir)) {
+  dir.create(updated_params$run_outdir)
   }
-dir.create(file.path(params$run_outdir, "out_files"))
-dir.create(file.path(params$run_outdir, "out_figures"))
+dir.create(file.path(updated_params$run_outdir, "out_files"))
+dir.create(file.path(updated_params$run_outdir, "out_figures"))
 
-knitr::kable(tibble::tibble(parameters = names(params),
-                            values = unname(unlist(params))))
+#knitr::kable(tibble::tibble(parameters = names(updated_params),
+#                            values = unname(unlist(updated_params))))
 ```
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
 knitr::opts_chunk$set(
-  fig.path = file.path(params$run_outdir, "out_figures/"),
+  fig.path = file.path(updated_params$run_outdir, "out_figures/"),
   out.width='2000px',
   dpi = 200
 )
@@ -57,13 +60,17 @@ knitr::opts_chunk$set(
 # Load Data and Meta-data
 
 ```{r data_loading, warning = FALSE, message = FALSE}
-full_dataset_path <- file.path(params$project_path, params$dataset_path)
+full_dataset_path <- file.path(updated_params$project_path, updated_params$dataset_path)
 
-if (params$inclusion_list == "") {
+if (updated_params$inclusion_list == "") {
   full_inclusion_file_path = NA_character_
 } else {
-  full_inclusion_file_path = file.path(params$repo_path, "supporting_files",
-                                       "inclusion_lists", params$inclusion_list)
+  full_inclusion_file_path = file.path(
+    Sys.getenv("doomics_zfs_root"),
+    "supporting_files",
+    "inclusion_lists",
+    updated_params$inclusion_list
+    )
 }
 
 # load all small molecule results as an mzroll_list (from claman)
@@ -88,7 +95,7 @@ if (nrow(malformed_measurements) != 0) {
 
 # filter unknowns from lipidomics
 
-if (params$annotation_data_type %in% c("lipids-neg", "lipids-pos")) {
+if (updated_params$annotation_data_type %in% c("lipids-neg", "lipids-pos")) {
   print("Filtering lipidomics unknowns")
    
   small_molecules <- romic::filter_tomic(
@@ -101,7 +108,7 @@ if (params$annotation_data_type %in% c("lipids-neg", "lipids-pos")) {
 }
 
 # floor and fill in missing sample observations with limit of detection
-small_molecules <- claman::floor_peaks(small_molecules, params$log2_limit)
+small_molecules <- claman::floor_peaks(small_molecules, updated_params$log2_limit)
 ```
 
 ## Compare Bookmarks with Matched Reextracted Features
@@ -112,7 +119,7 @@ bookmark_eic_comparison <- small_molecules$features %>%
   # add an adductName for all bookmarks/eics since unknowns won't have them
   dplyr::mutate(adductName = ifelse(
     is.na(adductName),
-    ifelse(stringr::str_detect(params$annotation_data_type, "neg"), "[M-H]-", "[M+H]+"),
+    ifelse(stringr::str_detect(updated_params$annotation_data_type, "neg"), "[M-H]-", "[M+H]+"),
     adductName
     )) %>%
   dplyr::group_by(compoundName, adductName) %>%
@@ -153,10 +160,13 @@ sample_summary <- small_molecules$samples %>%
 
 knitr::kable(sample_summary)
 
-if (params$set != "3") {
+if (updated_params$set != "3") {
 
-  design_matrix <- read_design_matrix(file.path(params$repo_path, "supporting_files",
-                                                "design_matrix_set1_and_set2.csv"))
+  design_matrix <- read_design_matrix(file.path(
+    Sys.getenv("doomics_zfs_root"),
+    "supporting_files",
+    "design_matrix_set1_and_set2.csv"
+    ))
 
   missing_samples <- design_matrix %>%
     dplyr::anti_join(small_molecules$samples, by = "sample_id")
@@ -203,7 +213,7 @@ above_limit_tresh = 0.9
 
 zero_counts <- samples_versus_negctl_df %>%
   dplyr::filter(sample_type == "sample") %>%
-  dplyr::mutate(above_limit = log2_abundance > params$log2_limit + 0.001,
+  dplyr::mutate(above_limit = log2_abundance > updated_params$log2_limit + 0.001,
                 above_limit = factor(above_limit, levels = c("TRUE", "FALSE"))) %>%
   dplyr::count(groupId, above_limit) %>%
   tidyr::spread(above_limit, n, fill = 0, drop = FALSE) %>%
@@ -272,7 +282,7 @@ dataset_nonmissing_sample_fractions <- tall_preliminary %>%
   dplyr::semi_join(bio_peaks, by = "groupId") %>%
   dplyr::filter(sample_type %in% c("sample", "posctl")) %>%
   dplyr::group_by(groupId) %>%
-  dplyr::summarize(nonmissing_frac = sum(log2_abundance > params$log2_limit + 0.001)/n())
+  dplyr::summarize(nonmissing_frac = sum(log2_abundance > updated_params$log2_limit + 0.001)/n())
 
 ggplot(dataset_nonmissing_sample_fractions, aes(x = nonmissing_frac)) +
   geom_histogram(binwidth = 0.05) +
@@ -340,7 +350,7 @@ loading_controlled <- claman::normalize_peaks(
   normalization_method = "median polish",
   quant_peak_varname = "log2_abundance",
   norm_peak_varname = "loading_log2_abundance",
-  log2_floor_value = params$log2_limit
+  log2_floor_value = updated_params$log2_limit
   )
 
 sample_diffs <- loading_controlled$measurements %>%
@@ -436,7 +446,7 @@ normalized_peaks <- claman::normalize_peaks(
     quant_peak_varname = "log2_abundance",
     norm_peak_varname = "b_centered_log2_abundance",
     batch_varnames = "unique_batch",
-    log2_floor_value = params$log2_limit,
+    log2_floor_value = updated_params$log2_limit,
     centering_fxn = median
   ) %>%
   claman::normalize_peaks(
@@ -444,7 +454,7 @@ normalized_peaks <- claman::normalize_peaks(
     quant_peak_varname = "loading_log2_abundance",
     norm_peak_varname = "loading_b_centered_log2_abundance",
     batch_varnames = "unique_batch",
-    log2_floor_value = params$log2_limit,
+    log2_floor_value = updated_params$log2_limit,
     centering_fxn = median
   ) %>%
   # compare samples to positive controls within the same batch
@@ -455,7 +465,7 @@ normalized_peaks <- claman::normalize_peaks(
     batch_varnames = "unique_batch",
     reference_varname = "sample",
     reference_values = "posctl",
-    log2_floor_value = params$log2_limit
+    log2_floor_value = updated_params$log2_limit
     ) %>%
   claman::normalize_peaks(
     normalization_method = "reference sample",
@@ -464,7 +474,7 @@ normalized_peaks <- claman::normalize_peaks(
     batch_varnames = "unique_batch",
     reference_varname = "sample",
     reference_values = "posctl",
-    log2_floor_value = params$log2_limit
+    log2_floor_value = updated_params$log2_limit
     )
 ```
 
@@ -487,14 +497,14 @@ if ("datetime" %in% colnames(normalized_peaks$samples)) {
     quant_peak_varname = "log2_abundance",
     norm_peak_varname = "loess_log2_abundance",
     weights_tribble = weights_tribble,
-    log2_floor_value = params$log2_limit
+    log2_floor_value = updated_params$log2_limit
     ) %>%
     claman::normalize_peaks(
       normalization_method = "loess",
       quant_peak_varname = "loading_log2_abundance",
       norm_peak_varname = "loading_loess_log2_abundance",
       weights_tribble = weights_tribble,
-      log2_floor_value = params$log2_limit
+      log2_floor_value = updated_params$log2_limit
       )
    
   group_subset <- normalized_peaks$features %>%
@@ -526,7 +536,7 @@ posctl_summary <- normalized_peaks %>%
   romic::filter_tomic("category", "samples", "posctl",  "sample_type") %>%
   {.$measurements} %>%
   tidyr::gather(processing, log2_abundance, -groupId, -sampleId) %>%
-  dplyr::filter(log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::filter(log2_abundance > updated_params$log2_limit + 0.001) %>%
   dplyr::group_by(processing, groupId) %>%
   dplyr::filter(n() > 2) %>%
   dplyr::summarize(
@@ -540,7 +550,7 @@ sample_summary <- normalized_peaks %>%
   romic::filter_tomic("category", "samples", "sample",  "sample_type") %>%
   {.$measurements} %>%
   tidyr::gather(processing, log2_abundance, -groupId, -sampleId) %>%
-  dplyr::filter(log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::filter(log2_abundance > updated_params$log2_limit + 0.001) %>%
   dplyr::group_by(processing, groupId) %>%
   dplyr::filter(n() > 2) %>%
   dplyr::summarize(
@@ -616,11 +626,11 @@ normalized_measurements %>%
 
 ```{r filter_to_viable_peakgroups}
 # choose final normalization
-# choose normalized measure based on params$normalization_var
+# choose normalized measure based on updated_params$normalization_var
   
 normalization_selected_measurements <- normalized_peaks$measurements %>%
-  # choose normalized measure based on params$normalization_var
-  dplyr::mutate(normalized_log2_abundance = !!rlang::sym(params$normalization_var))
+  # choose normalized measure based on updated_params$normalization_var
+  dplyr::mutate(normalized_log2_abundance = !!rlang::sym(updated_params$normalization_var))
 
 normalized_peaks <- romic::update_tomic(normalized_peaks, normalization_selected_measurements)
 
@@ -632,7 +642,7 @@ valid_mzroll_list <- romic::update_tomic(
   
 # sd within positive controls and within samples
 sample_type_measures <- valid_mzroll_list$measurements %>%
-  dplyr::filter(normalized_log2_abundance > params$log2_limit + 0.001) %>%
+  dplyr::filter(normalized_log2_abundance > updated_params$log2_limit + 0.001) %>%
   dplyr::left_join(
     valid_mzroll_list$samples %>%
       dplyr::select(sampleId, sample_type),
@@ -683,10 +693,10 @@ valid_mzroll_list$features <- valid_mzroll_list$features %>%
 bio_small_molecules <- claman::filter_groupIds(small_molecules, bio_peaks$groupId) 
 
 # all biologially entriched peakgroups including blanks, negctls, ...
-saveRDS(bio_small_molecules, file = file.path(params$run_outdir, "out_files", "small_molecules.Rds"))
+saveRDS(bio_small_molecules, file = file.path(updated_params$run_outdir, "out_files", "small_molecules.Rds"))
 # all reduced biological samples and biologically enriched peakgroups
-saveRDS(normalized_peaks, file = file.path(params$run_outdir, "out_files", "normalized_small_molecules.Rds"))
+saveRDS(normalized_peaks, file = file.path(updated_params$run_outdir, "out_files", "normalized_small_molecules.Rds"))
 # final reduced biological samples and valid peakgroups
-saveRDS(valid_mzroll_list, file = file.path(params$run_outdir, "out_files", "valid_small_molecules.Rds"))
+saveRDS(valid_mzroll_list, file = file.path(updated_params$run_outdir, "out_files", "valid_small_molecules.Rds"))
 ```
 
