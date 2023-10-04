@@ -2,10 +2,10 @@
 title: "DO Differential Abundance Testing"
 author: "Shackett, mmagzoub"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
-format:
-  html:
-    code-fold: true
-    code-summary: "Show the code"
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
 ---
 
 ```{r setup, include=FALSE}
@@ -15,7 +15,8 @@ params <- list(
   project_path = Sys.getenv("doomics_zfs_root"),
   repo_path = Sys.getenv("doomics_repo_path"),
   do_drive_token = Sys.getenv("doomics_drive_working_uri"),
-  run_outdir = file.path(Sys.getenv("doomics_zfs_root"), "data", "proteomics")
+  run_outdir = file.path(Sys.getenv("doomics_zfs_root"), "data", "proteomics"),
+  out_base_dir = Sys.getenv("doomics_out_base_dir")
 )
 
 run_outdir <- file.path(params$project_path, params$out_base_dir, "differential_abundances")
@@ -33,9 +34,8 @@ library(tidyverse)
 
 calibase::configure_google_access()
 
-source(file.path(params$repo_path, "utils", "data_prep.R"))
-source(file.path(params$repo_path, "utils", "linear_model_fxns.R"))
-source(file.path(params$repo_path, "utils", "support_fxns.R"))
+source(file.path(params$repo_path, "bioinformatics", "utils", "data_prep.R"))
+source(file.path(params$repo_path, "bioinformatics", "utils", "linear_model_fxns.R"))
 
 if (!file.exists(run_outdir)) {
   dir.create(run_outdir)
@@ -43,8 +43,8 @@ if (!file.exists(run_outdir)) {
   dir.create(file.path(run_outdir, "out_figures"))
   }
 
-knitr::kable(tibble::tibble(parameters = names(params),
-                            values = unname(unlist(params))))
+#knitr::kable(tibble::tibble(parameters = names(params),
+#                            values = unname(unlist(params))))
 ```
 
 # Load multiomic data (soluble metabolites, lipids, proteins)
@@ -93,9 +93,6 @@ stopifnot(
   all(identical_features$feature_1_data_type == identical_features$feature_2_data_type)
 )
 
-# retain just one entry
-# i guess you can filter by alphabetical order - useful but a little scary
-  
 # retain just one entry
 # i guess you can filter by alphabetical order - useful but a little scary
   
@@ -184,7 +181,6 @@ models_path <- file.path(run_outdir, 'out_files', 'lm_models.Rds')
 overwrite <- FALSE
 n_jobs <- 200
 n_bootstraps <- 1e6
-#n_bootstraps <- 1e5
 
 out_files <- tibble::tibble(job_id = 1:n_jobs) %>%
   dplyr::mutate(
@@ -204,6 +200,8 @@ if (all(out_files$exists) && !overwrite){
 } else if (any(out_files$exists) && !overwrite) {
   stop ("A subset of bootstrap outfiles exist, check the output of \"out_files\"")
 } else {
+  
+  stop("This shouldn't be needed right now - remove this exception to run bootstrapping")
   
   out_files %>%
     dplyr::filter(exists) %>%

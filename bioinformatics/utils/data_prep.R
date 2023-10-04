@@ -681,7 +681,8 @@ small_molecules_tall_do_abundances <- function(mzroll_list) {
 construct_features_with_design <- function (params, met_input = "valid") {
   
   # populate feature sets to look at
-  path_do_config <- file.path(params$repo_path, "do_config.json")
+  path_do_config <- file.path(params$repo_path, "bioinformatics", "1_wdl_processes", "do_config.json")
+  stopifnot(file.exists(path_do_config))
   path_out_base_dir <- file.path(params$project_path, params$out_base_dir)
   featurization_parameters <- suppressMessages(featurization_parameterization(path_do_config, path_out_base_dir))
   
@@ -755,7 +756,7 @@ load_sample_phenotypes <- function (params) {
     )
   
   # de-anonymize samples
-  sample_labels <- load_sample_labels(params$repo_path)
+  sample_labels <- load_sample_labels(params$project_path)
   
   sample_phenotypes <- sample_labels %>%
     dplyr::left_join(mouse_phenotypes$mouse_level_phenotypes, by = "Mouse.ID") %>%
@@ -903,6 +904,7 @@ load_small_molecules <- function (featurization_parameters, met_input) {
   cross_set_lipids <- all_small_molecules %>%
     dplyr::filter(data_type %in% c("lipids-neg", "lipids-pos")) %>%
     dplyr::distinct(dataset, peak_label, adductName) %>%
+    dplyr::filter(stringr::str_detect(peak_label, "^unk [0-9]+\\.[0-9]+ @ [0-9]+(\\.[0-9])?$", negate = TRUE)) %>%
     dplyr::group_by(peak_label, adductName) %>%
     dplyr::filter(n() == 2) %>%
     dplyr::distinct(peak_label, adductName) %>%

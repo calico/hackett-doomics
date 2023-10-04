@@ -18,32 +18,31 @@ tags:
 ```{r package_loading, message = FALSE, warning = FALSE}
 library(tidyverse)
 
-params <- append(
+run_params <- append(
   params,
   list(
     dataset_path = file.path(Sys.getenv("doomics_zfs_root"), "data"),
     path_to_do_github = Sys.getenv("doomics_repo_path"),
-    run_outdir = file.path(Sys.getenv("doomics_zfs_root"), "data", "proteomics")
+    run_outdir = file.path(Sys.getenv("doomics_zfs_root"), Sys.getenv("doomics_out_base_dir"), "proteomics")
     ))
 
-if (!file.exists(params$run_outdir)) {
-  dir.create(params$run_outdir)
-  dir.create(file.path(params$run_outdir, "out_files"))
-  dir.create(file.path(params$run_outdir, "out_figures"))
+if (!file.exists(run_params$run_outdir)) {
+  dir.create(run_params$run_outdir)
+  dir.create(file.path(run_params$run_outdir, "out_files"))
+  dir.create(file.path(run_params$run_outdir, "out_figures"))
 }
 
-knitr::kable(tibble::tibble(parameters = names(params),
-                            values = unname(unlist(params))))
+#knitr::kable(tibble::tibble(parameters = names(run_params),
+#                            values = unname(unlist(run_params))))
 
-source(file.path(params$path_to_do_github, "utils", "data_prep.R"))
-
+source(file.path(run_params$path_to_do_github, "bioinformatics", "utils", "data_prep.R"))
 ```
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
 knitr::opts_chunk$set(
-  fig.path = file.path(params$run_outdir, "out_figures/"),
+  fig.path = file.path(run_params$run_outdir, "out_figures/"),
   out.width='2000px',
   dpi = 200
 )
@@ -95,22 +94,22 @@ format_protein_table <- function(dataset_path, design_matrix){
   protein.obs
 }
 
-DOBATCH1.design.matrix <- readr::read_csv(file.path(params$dataset_path, 'proteomics/in_files/compms/design_matrix_DOBATCH1_TRYPSIN_30AUG2019.csv')) %>%
+DOBATCH1.design.matrix <- readr::read_csv(file.path(run_params$dataset_path, 'proteomics/in_files/compms/design_matrix_DOBATCH1_TRYPSIN_30AUG2019.csv')) %>%
   dplyr::mutate('condition' = as.character(condition),
                 # format sample_id which is set_name for DOBATCH1
                 'sample_id' = stringr::str_c(set, '_', stringr::str_sub(name, 3)),
                 'unique_batch' = stringr::str_c(set, '_', batch)) %>%
   select(condition, sample_id, unique_batch)
-DOBATCH1.compms.RA <- format_protein_table(file.path(params$dataset_path, 'proteomics/in_files/compms/comp_ms_308_std_refcond_1_fcAvg_simple_mod_DOBATCH1.csv'), DOBATCH1.design.matrix)
+DOBATCH1.compms.RA <- format_protein_table(file.path(run_params$dataset_path, 'proteomics/in_files/compms/comp_ms_308_std_refcond_1_fcAvg_simple_mod_DOBATCH1.csv'), DOBATCH1.design.matrix)
 
 
-DOBATCH2.design.matrix <- readr::read_csv(file.path(params$dataset_path, 'proteomics/in_files/compms/design_matrix_MCA_DOBATCH2_MCA_TRYPSIN_23AUG2019_03DEC2019.csv')) %>%
+DOBATCH2.design.matrix <- readr::read_csv(file.path(run_params$dataset_path, 'proteomics/in_files/compms/design_matrix_MCA_DOBATCH2_MCA_TRYPSIN_23AUG2019_03DEC2019.csv')) %>%
   mutate('condition' = as.character(condition),
          # format sample_id which is set_name for DOBATCH1
          'sample_id' = stringr::str_c('3_', s), 
          'unique_batch' = stringr::str_c('3_', batch)) %>%
   select(condition, sample_id, unique_batch)
-DOBATCH2.compms.RA <- format_protein_table(file.path(params$dataset_path, 'proteomics/in_files/compms/comp_ms_328_std_refcond_1_fcAvg_simple_mod_DOBATCH2.csv'), DOBATCH2.design.matrix)
+DOBATCH2.compms.RA <- format_protein_table(file.path(run_params$dataset_path, 'proteomics/in_files/compms/comp_ms_328_std_refcond_1_fcAvg_simple_mod_DOBATCH2.csv'), DOBATCH2.design.matrix)
 
 n_samples <- nrow(DOBATCH1.design.matrix) + nrow(DOBATCH2.design.matrix)
 
@@ -124,7 +123,6 @@ compms.RA <- bind_rows(DOBATCH1.compms.RA, DOBATCH2.compms.RA)
 It looks like there is quite a bit of variability in bridge samples and that they cluster with an unclear structure -- this suggests that bridge samples may not be directly comparable. This comparison is not entirely fair however; a structure like this could exist while still allowing for the correction of batch effects on samples if samples were similarly affected by the above technical structure. Instead, we can look for structure in bridge-corrected samples after smoothing out most biological signals by averaging over all samples within a TMT batch.
 
 ```{r tmt_ra_correlations, fig.align = "center"}
-####################
 batch_average_RA_matrix <- compms.RA %>%
   dplyr::group_by(NameUnique, unique_batch) %>%
   dplyr::summarize(batch.avg.RA = mean(log2.RA)) %>%
@@ -204,10 +202,10 @@ compms.RA <- normalized_peptide_RA %>%
 compms.RA <- compms.RA %>%
   dplyr::semi_join(compms.RA %>%
                      dplyr::count(NameUnique) %>%
-                     dplyr::filter(n > n_samples - (n_samples * params$max_percent_missing)), 
+                     dplyr::filter(n > n_samples - (n_samples * run_params$max_percent_missing)), 
                    by = 'NameUnique')
 
-saveRDS(compms.RA, file.path(params$dataset_path, 'proteomics/out_files/compms_proteomics_features.RDS'))
+saveRDS(compms.RA, file.path(run_params$run_outdir, 'out_files/compms_proteomics_features.RDS'))
 ```
 
 
