@@ -1,6 +1,6 @@
 workflow biom {
     
-    File path_do_config = "${doomics_repo_path}/do_config.json"
+    File path_do_config = "<<PATH_TO_do_config.json>>"
     Boolean overwrite = true
     
     call globals_parse_json {
@@ -148,7 +148,7 @@ task featurization {
   File json_path_table
   Boolean overwrite
   
-  String Rmd_rel_path = "/utils/call_Rmd.R"
+  String Rmd_rel_path = "/bioinformatics/utils/call_Rmd.R"
   String call_Rmd_path = repo_path + Rmd_rel_path
   
   command <<<

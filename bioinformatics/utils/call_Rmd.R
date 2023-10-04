@@ -56,6 +56,7 @@ upload_knitted_html <- function (out_dir, doc_name, connect_id = NULL) {
   
   if (length(out_htmls) == 1) {
     full_html_path <- file.path(out_dir, out_htmls)
+    print(glue::glue("Uploading {full_html_path} to Connect"))
     
     calibase::connect_deploy_doc(
       full_html_path,
@@ -64,6 +65,8 @@ upload_knitted_html <- function (out_dir, doc_name, connect_id = NULL) {
       appId = connect_id,
       forceUpdate = TRUE
       )
+  } else {
+    cli::cli_abort("{length(out_htmls)} .html files exist in {.file {out_dir}}")
   }
 }
 
@@ -79,7 +82,7 @@ featurization_scripts = tibble::tribble(
 if (interactive()) {
   # interactive
   formatted_flags <- c(
-    process_feature_id = "small-molecules.metabolites-neg.metabolites-neg-12",
+    process_feature_id = "small-molecules.lipids-neg.lipids-neg-3",
     json_path_table = "~/cromwell-executions/biom/f1b7548a-f8d7-4064-9d56-c3a48d5507e5/call-featurization/shard-0/inputs/149462423/featurization_table.tsv",
     path_do_config = file.path(Sys.getenv("doomics_repo_path"), "bioinformatics", "1_wdl_processes", "do_config.json"),
     overwrite = "true"
@@ -176,16 +179,11 @@ if (script_mode == "featurization") {
     run_params <- run_params[!(names(run_params) %in% c("eval", "out_base_dir"))]
     run_params$run_outdir = run_outdir
     
-    if (interactive()) {
-      params <- run_params
-    }
-    
     rmd_paramers <- run_params[!(names(run_params) %in% c("connect_id"))]
     rmarkdown::render(input = call_script_path,
                       output_dir = run_outdir,
                       params = rmd_paramers,
                       envir = new.env())
-    
     
     # upload rendered .html
     doc_name = glue::glue("DO Mice : {run_id}")
@@ -195,6 +193,8 @@ if (script_mode == "featurization") {
     } else {
       connect_id <- NULL
     }
+    
+    print("Uploading knitted document to Connect")
     upload_knitted_html(run_outdir, doc_name, connect_id = connect_id) 
   }}
 

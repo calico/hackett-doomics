@@ -1,4 +1,12 @@
 {   
+    "globals":{
+        "project_path":"SECRETS_MOVED_TO_RENVIRON",
+        "repo_path":"SECRETS_MOVED_TO_RENVIRON",
+        "do_drive_token":"SECRETS_MOVED_TO_RENVIRON",
+        "shock_token":"SECRETS_MOVED_TO_RENVIRON",
+        "out_base_dir":"SECRETS_MOVED_TO_RENVIRON",
+        "n_slurm_jobs":"50"
+    },
     "featurization":{
         "small-molecules":{
             "metabolites-neg":{
@@ -8,7 +16,7 @@
                     "inclusion_list":"polar_metabolites_neg_files_to_include.txt",
                     "normalization_var":"loading_b_centered_log2_abundance",
                     "annotation_data_type":"metabolites-neg",
-                    "eval":"TRUE"  
+                    "eval":"FALSE"  
                 },
                 "metabolites-neg-3":{
                     "set":"3",
@@ -16,7 +24,7 @@
                     "inclusion_list":"M001A_time_stamps.tsv",
                     "normalization_var":"loading_b_centered_log2_abundance",
                     "annotation_data_type":"metabolites-neg",
-                    "eval":"TRUE"  
+                    "eval":"FALSE"  
                 }
             },
             "metabolites-pos":{
@@ -26,7 +34,7 @@
                     "inclusion_list":"polar_metabolites_pos_files_to_include.txt",
                     "normalization_var":"loading_b_centered_log2_abundance",
                     "annotation_data_type":"metabolites-pos",
-                    "eval":"TRUE"  
+                    "eval":"FALSE"  
                 },
                 "metabolites-pos-3":{
                     "set":"3",
@@ -34,7 +42,7 @@
                     "inclusion_list":"M002A_time_stamps.tsv",
                     "normalization_var":"loading_b_centered_log2_abundance",
                     "annotation_data_type":"metabolites-pos",
-                    "eval":"TRUE"
+                    "eval":"FALSE"
                 }
             },
             "lipids-neg":{
