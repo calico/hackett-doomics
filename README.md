@@ -15,6 +15,8 @@ Analyses are divided into two major phases:
   - 2_non_wdl_processes: manually run notebooks which aggregate proteomics results and perform differential expression (with bootstrapping in SLURM):
     - [Proteomics](http://public-rstudio-connect.calicolabs.com/doomics_proteomics/)
     - [Differential Expression](http://public-rstudio-connect.calicolabs.com/doomics_diffex/)
+  - 3_interactive: organize results and upload them to GCS to support major_analyses and the Shiny app
+    - [GCS Setup](http://public-rstudio-connect.calicolabs.com/gcs_setup/)
 
 - Major Analyses: Reproducible notebooks reproducing the vast majority of figures and tables starting from data which end-users can download from Google Cloud Platform (GCP). 
 

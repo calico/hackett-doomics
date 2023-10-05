@@ -5,8 +5,6 @@ date: "`r format(Sys.time(), '%d %B, %Y')`"
 format:
   html:
     embed-resources: true
-    code-fold: true
-    code-summary: "Show the code"
     toc: true
     theme: minty
     highlight: tango
@@ -18,24 +16,27 @@ format:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# Organize Dependencies
+
 ```{r globals}
 params <- list(
   project_path = Sys.getenv("doomics_zfs_root"),
   repo_path = Sys.getenv("doomics_repo_path"),
   do_drive_token = Sys.getenv("doomics_drive_working_uri"),
   shock_token = Sys.getenv("doomics_shock_token"),
-  out_base_dir = Sys.getenv("out_base_dir")
+  out_base_dir = Sys.getenv("doomics_out_base_dir")
 )
 
 calibase::configure_google_access()
 
-source(file.path(params$repo_path, "utils", "data_prep.R"))
-#source(file.path(params$repo_path, "utils", "support_fxns.R"))
-source(file.path(params$repo_path, "3_interactive", "results_browser", "interactive.R"))
+source(file.path(params$repo_path, "bioinformatics", "utils", "data_prep.R"))
+source(file.path(params$repo_path, "bioinformatics", "3_interactive", "results_browser", "interactive.R"))
 
 suppressPackageStartupMessages(library(dplyr))
 suppressPackageStartupMessages(library(ggplot2))
 ```
+
+# Load Results
 
 ```{r load_regression_outputs}
 diffex_outdir <- file.path(params$project_path, params$out_base_dir, "differential_abundances")
@@ -109,6 +110,8 @@ if (nrow(unmatched_features) != 0) {
 }
 ```
 
+## Reorganize Results and Validate that Different Files are Consistent
+
 ```{r read_other_summaries}
 model_signif <- model_signif_raw %>%
   dplyr::mutate(plotting_priority = dplyr::case_when(
@@ -138,6 +141,7 @@ check_regression_summaries(
 )
 ```
 
+## Project Out Batch Effects
 
 ```{r correcting_batch_effects}
 # project out nuisance variation and cluster features
@@ -170,6 +174,8 @@ projected_features_with_design <- features_with_design %>%
   dplyr::select(-xs_batch_adj)
 ```
 
+## Cluster Features Using Gaussian Mixture Models
+
 ```{r clustering}
 # also remove sex effects then cluster features into K clusters
 
@@ -200,7 +206,7 @@ gmm_df <- sex_controlled_projection %>%
     observation = sex_controlled_abundance
     )
 
-gmm_clusters_cache_path <- file.path(Sys.getenv("scratch_dir"), "gmm_clusters.Rds")
+gmm_clusters_cache_path <- file.path(Sys.getenv("doomics_scratch_dir"), "gmm_clusters.Rds")
 if (file.exists(gmm_clusters_cache_path)) {
   gmm_clusters <- readRDS(gmm_clusters_cache_path)
 } else {
@@ -231,6 +237,8 @@ feature_clusters <- best_clusters$membership[[1]] %>%
   dplyr::mutate(cluster = factor(cluster, levels = sort(unique(cluster))))
 ```
 
+## Organize Results as T\*Omic Objects To Take Advantage of *romic*
+
 ```{r romic_formatting}
 tidy_features <- projected_features_with_design %>%
   dplyr::semi_join(features_with_design %>%
@@ -255,48 +263,153 @@ tidy_features <- projected_features_with_design %>%
   romic::center_tomic(c("corrected_log2_abundance", "normalized_log2_abundance"))
 ```
 
-```{r interactive_viz}
-if (interactive()) {
-  library(shiny)
+# Consolidate Genetics and Informatics Results
 
-  # interactive heatmap
-  tidy_features %>%
-    romic::filter_tomic(
-      filter_type = "category",
-      filter_table = "features",
-      filter_variable = "data_type",
-      c("lipids-neg", "lipids-pos", "metabolites-neg", "metabolites-pos", "olink", "tryptic-compms")
+```{r find_wdl_outputs}
+featurization_parameters <- featurization_parameterization(
+  file.path(params$repo_path, "bioinformatics", "1_wdl_processes", "do_config.json"),
+  params$out_base_dir
+)
+
+all_normalized_peaks <- featurization_parameters %>%
+  mutate(
+    peaks_path = file.path(params$project_path, dataset_path, "out_files", "normalized_small_molecules.Rds"),
+    peaks_dat = purrr::map(peaks_path, readRDS)
     ) %>%
-    romic::app_heatmap()
-  
-  # interactive coloring of PCs
-  romic::app_pcs(tidy_features)
-}
+  dplyr::select(data_type, data_partition, peaks_dat)
 ```
 
+```{r genetics}
+read_physical_map <- function (ls_data_dir) {
+  
+  # copied from Kevin's measure_qtls.R
+  
+  pmap_file <- file.path(ls_data_dir, "mm_uwisc_v1_filter_200325.pmap.csv")
+  genoprob_file <- file.path(ls_data_dir, "prob.8state_jax_shock_191218.Rdata")
+  
+  load(genoprob_file)
+  
+  physical_map <- qtl2::read_csv(pmap_file, rownames_included = FALSE)
+  
+  lt <- list()
+  for(n in names(apr)){
+      marker <-(dimnames(apr[[n]])[[3]])
+      lt[[n]] <- as.data.frame(marker)
+      #print(paste(n, length(tmp)))
+  }
+  markdf <- do.call(plyr::rbind.fill, lt)  #pylr function to collapse list of dfs to sinlge column
+  physical_map_edit <- inner_join(physical_map, markdf, by = c("marker"))
+  
+  print('dim(physical_map_edit)')
+  print(dim(physical_map_edit))
+  
+  # remotes::install_github("rqtl/qtl2convert")
+  
+  # Convert map data frame to list
+  pmap <- physical_map_edit %>% 
+    # Make sure the chromosoms are in the factored properly, if we don't do this
+    data.frame() %>% qtl2convert::map_df_to_list(marker_column = 'marker' , pos_column = 'pos', chr_column= 'chr')
+  
+  #convert pmap value from char to numeric
+  count_num_markers = 0
+  for(n in names(pmap)){
+    #use list apply, lapply, to convert char to numeric. this is imp to use to keep markers as row names 
+    pmap[[n]] <- lapply(pmap[[n]], function(x) as.numeric(x))
+    #transform to mega_bases - make it compatibile with snp_scan --- cc_variants.sqlite data
+    #pmap[[n]] <- lapply(pmap[[n]], function(x) x /1000000)  
+    pmap[[n]] <- unlist(pmap[[n]])
+    count_num_markers = count_num_markers + length( pmap[[n]] )          
+  }
+  
+  return(pmap)
+}
+
+process_trait <- function (feature_name, measure, qtl_results_path) {
+  
+  feature_dir <- file.path(qtl_results_path, feature_name)
+  
+  lod_path <- file.path(file.path(feature_dir, paste0(measure, ".lod.Rdata")))
+  null_lod_paths <- file.path(feature_dir, paste0(measure, ".permute100.Rdata"))
+  
+  if (!file.exists(lod_path) | !file.exists(null_lod_paths)) {
+    return(NULL)
+  }
+  
+  load(lod_path)
+  # 75K SNP scan (Rqtl2 object)
+  load(null_lod_paths)
+  
+  out <- tibble(
+    snp_scan_data = list(snp_scan_data),
+    permute_scan = list(permute_scan)
+  )
+  
+  return(out)
+}
+
+qtl_results_path <- file.path(params$project_path, "genetics", "qtl_mapping") 
+pmap <- read_physical_map(file.path(params$project_path, "genetics", "pmap_files"))
+
+# identify all traits w/ qtl results
+molecules <- list.files(qtl_results_path)
+measures <- c("average_abundance", "early_age", "late_age")
+
+all_qtl_results <- tidyr::crossing(
+  feature_name = molecules,
+  measure = measures
+) %>%
+  dplyr::mutate(trait_results = purrr::map2(
+    feature_name,
+    measure,
+    process_trait,
+    qtl_results_path = qtl_results_path
+    )) %>%
+  # drop null traits (these are just non-abundance traits which were not
+  # rerun when updating the qtl pipeline)
+  filter(!purrr::map_lgl(trait_results, is.null)) %>%
+  tidyr::unnest(trait_results)
+```
+
+# Export to GCS
+
 ```{r upload_gcp_assets}
-shiny_assets_dir <- file.path(params$project_path, "shiny_assets")
+shiny_assets_dir <- file.path(params$project_path, "doomics_public_gcs_data")
 if (!dir.exists(shiny_assets_dir)) {
   dir.create(shiny_assets_dir)
 }
 
+# data modality-specific summaries which include additional metadata
 saveRDS(feature_design_list, file.path(shiny_assets_dir, "feature_design_list.Rds"))
+# statistical significance of select regression terms
 saveRDS(model_signif, file.path(shiny_assets_dir, "model_signif.Rds"))
+# summaries of individual models fit with parameters, fits, AICc, ...
+# for model comparison and pathway delta age
 saveRDS(lm_models, file.path(shiny_assets_dir, "lm_models.Rds"))
+# statistical significance for all regression terms in all models
 file.copy(
   file.path(diffex_outdir, "out_files", "all_model_signif.Rds"),
   file.path(shiny_assets_dir, "all_model_signif.Rds"),
   overwrite = TRUE
 )
 
-projected_features_with_design %>%
+# features_w_design - all features and samples with lots of metadata
+projected_features_with_design_aug <- projected_features_with_design %>%
   dplyr::left_join(feature_clusters, by = "feature_name") %>%
   dplyr::mutate(
     cluster = ifelse(is.na(cluster), -1, cluster),
     cluster = factor(cluster, levels = sort(unique(cluster)))
-    ) %>%
-  saveRDS(file.path(shiny_assets_dir, "features_with_design.Rds"))
+    )
 
+saveRDS(
+  projected_features_with_design_aug,
+  file.path(shiny_assets_dir, "features_with_design.Rds")
+  )
+
+projected_features_with_design_aug %>%
+  filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics")) %>%
+  saveRDS(file.path(shiny_assets_dir, "features_with_design_core.Rds"))
+
+# features_w_design as a T\*Omic object
 saveRDS(tidy_features, file.path(shiny_assets_dir, "tidy_features.Rds"))
 
 tidy_features %>%
@@ -304,9 +417,9 @@ tidy_features %>%
       filter_type = "category",
       filter_table = "features",
       filter_variable = "data_type",
-      c("lipids-neg", "lipids-pos", "metabolites-neg", "metabolites-pos", "olink", "tryptic-compms")
+      c("lipids-neg", "lipids-pos", "metabolites-neg", "metabolites-pos", "tryptic-compms")
     ) %>%
-  saveRDS(file.path(shiny_assets_dir, "tidy_features_no_peptides.Rds"))
+  saveRDS(file.path(shiny_assets_dir, "tidy_features_core.Rds"))
 
 tidy_features %>%
     romic::filter_tomic(
@@ -317,27 +430,53 @@ tidy_features %>%
     ) %>%
   saveRDS(file.path(shiny_assets_dir, "tidy_features_peptides.Rds"))
 
-# move informatics outputs
+# genetics and bioinformatics summaries
 
-informatics_assets_dir <- file.path(shiny_assets_dir, "informatics")
+saveRDS(all_normalized_peaks, file.path(shiny_assets_dir, "all_normalized_peaks.Rds"))
+saveRDS(all_qtl_results, file.path(shiny_assets_dir, "all_qtl_results.Rds"))
+
+# move specific informatics outputs
+
+informatics_assets_dir <- file.path(shiny_assets_dir, "select_informatics_plots")
 if (!dir.exists(informatics_assets_dir)) {
   dir.create(informatics_assets_dir)
 }
 
-R.utils::copyDirectory(
-  from = file.path(params$project_path, "data", "proteomics"),
-  to = file.path(informatics_assets_dir, "proteomics")
+# metabolomic & lipidomics plots
+
+injection_plots_df <- featurization_parameters %>%
+  filter(set == "1/2", data_type %in% c("metabolites-neg", "metabolites-pos")) %>%
+  mutate(
+    plot_path = file.path(params$project_path, dataset_path, "out_figures", "injection_comparison-1.png"),
+    exists = file.exists(plot_path),
+    updated_name = glue::glue("{data_type}_injection_comparison.png"),
+    updated_path = file.path(shiny_assets_dir, "select_informatics_plots", updated_name)
+    ) 
+
+# move and rename figures
+purrr::walk2(
+  injection_plots_df$plot_path,
+  injection_plots_df$updated_path,
+  file.copy
 )
 
-R.utils::copyDirectory(
-  from = file.path(params$project_path, out_base_dir$out_base_dir),
-  to = file.path(informatics_assets_dir, "metabolites_lipids")
-)
+# proteomics plots
 
-R.utils::removeDirectory(
-  file.path(informatics_assets_dir, "metabolites_lipids", "differential_abundances", "out_files", "bootstrap_results"),
-  recursive = TRUE
+select_proteomics_plots <- c(
+  "batch_post_correction-1.png",
+  "tmt_ra_correlations-1.png",
+  "tmt_bridge_correlations-1.png"
+  )
+
+proteomics_informatics_plot_path <- file.path(params$project_path, params$out_base_dir, "proteomics", "out_figures")
+
+purrr::walk2(
+  file.path(proteomics_informatics_plot_path, select_proteomics_plots),
+  file.path(shiny_assets_dir, "select_informatics_plots", select_proteomics_plots),
+  file.copy
 )
 
 # add to GCS
+# gcloud config set project <<PROJECT_ID>>
+# gsutil cp -r <<PATH_TO_PROJECT_DATA>>/doomics_public_gcs_data/* gs://<<BUCKET_ID>>/
 ```
