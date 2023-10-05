@@ -1,5 +1,5 @@
 ---
-title: "Setup Shiny Assets"
+title: "Setup GCS and Shiny Assets"
 author: "Shackett"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 format:
@@ -263,7 +263,9 @@ tidy_features <- projected_features_with_design %>%
   romic::center_tomic(c("corrected_log2_abundance", "normalized_log2_abundance"))
 ```
 
-# Consolidate Genetics and Informatics Results
+# Other Outputs
+
+## Informatics Results
 
 ```{r find_wdl_outputs}
 featurization_parameters <- featurization_parameterization(
@@ -278,6 +280,8 @@ all_normalized_peaks <- featurization_parameters %>%
     ) %>%
   dplyr::select(data_type, data_partition, peaks_dat)
 ```
+
+## Genetics
 
 ```{r genetics}
 read_physical_map <- function (ls_data_dir) {
@@ -370,6 +374,32 @@ all_qtl_results <- tidyr::crossing(
   tidyr::unnest(trait_results)
 ```
 
+## Non-Omics Phenotyping
+
+```{r shock}
+this_study_do_ids <- tidy_features$data  %>%
+  distinct(Mouse.ID) 
+
+mouse_phenotypes_reduced <- load_mouse_phenotypes(shock_token = params$shock_token)
+mouse_phenotypes_full <- load_mouse_phenotypes(shock_token = params$shock_token, reduced_phenotypes = FALSE)
+
+# reduce to just mice in DOOMICs study aside from reduced phenotypes
+# which are used to show the distribution of lifespans across the full SHOCK study
+mouse_phenotypes_reduced$age_based_phenotypes <- mouse_phenotypes_reduced$age_based_phenotypes %>%
+  semi_join(this_study_do_ids, by = "Mouse.ID")
+
+mouse_phenotypes_full$mouse_level_phenotypes <- mouse_phenotypes_full$mouse_level_phenotypes %>%
+  semi_join(this_study_do_ids, by = "Mouse.ID")
+
+mouse_phenotypes_full$age_based_phenotypes <- mouse_phenotypes_full$age_based_phenotypes %>%
+  semi_join(this_study_do_ids, by = "Mouse.ID")
+
+mouse_phenotypes <- list(
+  mouse_phenotypes_full = mouse_phenotypes_full,
+  mouse_phenotypes_reduced = mouse_phenotypes_reduced
+)
+```
+
 # Export to GCS
 
 ```{r upload_gcp_assets}
@@ -434,6 +464,7 @@ tidy_features %>%
 
 saveRDS(all_normalized_peaks, file.path(shiny_assets_dir, "all_normalized_peaks.Rds"))
 saveRDS(all_qtl_results, file.path(shiny_assets_dir, "all_qtl_results.Rds"))
+saveRDS(mouse_phenotypes, file.path(shiny_assets_dir, "mouse_phenotypes.Rds"))
 
 # move specific informatics outputs
 
