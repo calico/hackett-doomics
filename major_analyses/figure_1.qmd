@@ -22,21 +22,19 @@ knitr::opts_chunk$set(echo = TRUE)
 suppressPackageStartupMessages(library(tidyverse))
 
 # load functions for data download and figure upload
+if (basename(getwd()) != "major_analyses") {
+  stop(
+  "Please run this code from the major_analyses directory; this should be the
+  default if you are rendering a .qmd")
+}
+
 source("manuscript_prep_utils.R")
 
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-
-# other figure-specific configuration
-
-# drive ID for manuscript figures and other assets
-manuscript_drive_root <- googledrive::as_id(params$manuscript_drive_root)
+tidy_omics <- load_doomics("tomic", params$cache_dir)
 
 # load SHOCK results from Drive
 # its unclear whether and how much of this data we can release so
