@@ -1,0 +1,986 @@
+---
+title: "Figure 4 - Aging Archetypes"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+The Figure 3 section identifies the union of aging and longevity-associated pathways that we may be interested in but many pathways show up in multiple aging regressions. This section will delve into which pathways are associated with particular modes of aging (e.g., chronological aging versus fraction of life lived).
+
+This is done using head-to-head model comparisons using AIC. The goal of this to determine which aging regression model best fits each pathway (accounting for relative degrees of freedom) by aggregating per-feature model summaries.
+
+After assigning pathways to specific modes of aging we can select some of the strongest and/or most interesting features associated with each pathway to add context to univariate volcano plots, and bivariate signed-significance plots.
+
+Outputs:
+
+- figure_4_out:
+    - longevity_features_to_top_pathway: features associated with aging/longevity assigned to a specific GO category and mode of aging
+    - top_longevity_hits_in_pathways: top hits in each pathway for downstream visualization 
+    - top_pathways_for_term_affinity: pathways and their members including non-pathway-associated proteins, metabolites, and lipids as separate categories.
+    - term_affinity_summaries: pathways assigned to specific aging modes
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and redentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+domics_signif <- load_domics("signif", domics_paths) %>%
+  filter(data_modality %in% c("metabolomics", "proteomics", "lipidomics"))
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+features_with_design <- load_domics("features", domics_paths)
+
+# raw model fits
+signif_all_models <- load_domics("signif_all_models", domics_paths)
+model_summaries <- signif_all_models %>%
+  dplyr::select(-params, -fits) %>%
+  tidyr::unnest(model_summary) %>%
+  # calculate AICc
+  dplyr::mutate(
+    AICc = AIC + (2*(df^2) + 2*df) / (nobs - df - 1)
+  )
+
+features <- romic::get_tomic_table(tidy_omics, "features") %>%
+  add_feature_label(feature_design_list) %>%
+  filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
+  
+samples <- romic::get_tomic_table(tidy_omics, "samples")
+
+# script-specific setup
+# load gsea results from  and cleaned up metadata from figure_3.Rmd
+figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
+feature_signif <- figure_3_out$feature_signif_aug
+
+library(patchwork) # for combining grobs
+source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+
+overwrite = FALSE
+```
+
+## Effect overlap
+
+```{r effect_overlap, fig.height = 9, fig.width = 11}
+filtered_significance <- domics_signif %>%
+  filter(!is.na(q.value)) %>%
+  mutate(is_signif = ifelse(q.value < 0.1, 1, 0)) %>%
+  group_by(term) %>%
+  filter(sum(is_signif) > 0) %>%
+  ungroup() %>%  
+  select(groupId, data_modality, term, is_signif)
+
+term_metadata <- filtered_significance %>%
+  filter(is_signif == 1) %>%
+  count(term) %>%
+  mutate(term_type = ifelse(term %in% c("early G8", "late blood draw"), "technical", "biological")) %>%
+  arrange(desc(term_type), desc(n)) %>%
+  filter(term != "late age x male") %>%
+  mutate(ordered_term = factor(term, levels = c("early G8", "late blood draw", "early age", "late age", "lifespan remaining", "fraction of life lived", "lifespan", "late age x lifespan", "sex", "fraction of life lived x sex", "ddm")))
+
+crossed_significance <- crossing(
+  term_metadata %>% select(term1 = term),
+  term_metadata %>% select(term2 = term)
+) %>%
+  filter(term1 != term2) %>%
+  left_join(
+    filtered_significance %>%
+      rename(term1 = term, signif1 = is_signif),
+    by = "term1",
+    relationship = "many-to-many"
+  ) %>%
+  left_join(
+    filtered_significance %>%
+      rename(term2 = term, signif2 = is_signif),
+    by = c("term2", "groupId", "data_modality")
+  )
+    
+crossed_signif_compare <- crossed_significance %>%
+  # only consider overlap for features where both effects could be estimated
+  filter(!is.na(signif1), !is.na(signif2)) %>%
+  nest(paired_terms = -c(term1, term2)) %>%
+  mutate(pair_fisher = map(paired_terms, function (dat) {
+    fisher.test(dat$signif1, dat$signif2, alternative = "greater") %>%
+      broom::glance() %>%
+      select(estimate, p.value) %>%
+      mutate(
+        Pr_1_2 = mean(dat$signif1[dat$signif2 == 1]),
+        Pr_2_1 = mean(dat$signif2[dat$signif1 == 1])
+        )
+  })) %>%
+  select(-paired_terms) %>%
+  unnest(pair_fisher) %>%
+  # add term ordering
+  left_join(term_metadata %>% select(term1 = term, ordered_term1 = ordered_term), by = "term1", multiple = "all") %>%
+  left_join(term_metadata %>% select(term2 = term, ordered_term2 = ordered_term), by = "term2", multiple = "all") %>%
+  # filter to upper diagonal
+  filter(as.integer(ordered_term1) > as.integer(ordered_term2))
+
+crossed_signif_plot <- crossed_signif_compare %>%
+  mutate(
+    nlog10pvalue = -1*log10(p.value),
+    nlog10pvalue = pmin(nlog10pvalue, 30),
+    ordered_term1 = fct_rev(ordered_term1),
+    enrichment = round(estimate, 1),
+    cell_label = ifelse(
+      p.value < 1e-5,
+      glue::glue("p(x|y)={round(Pr_1_2, 2)}\np(y|x)={round(Pr_2_1, 2)}"),
+      NA
+    )) %>%
+  ggplot(aes(x = ordered_term1, y = ordered_term2, fill = nlog10pvalue, label = cell_label)) +
+  geom_raster() +
+  geom_text(aes(color = ifelse(nlog10pvalue > 20, "gray20", "gray90"))) +
+  scale_fill_viridis_c(expression(-log[10]~"p-value"), option = "magma", breaks = c(10, 20, 30), labels = c("10", "20", ">30")) +
+  scale_color_identity() +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title = element_blank(),
+    legend.position = "bottom",
+    axis.text = element_text(size = 12)
+    )
+  
+crossed_signif_plot
+create_and_upload_figure(
+  name = "crossed_significance",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 11,
+  height = 9,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+```{r mini_effect_overlap, fig.height = 8, fig.width = 8}
+select_terms <- c("late age", "lifespan", "fraction of life lived", "lifespan remaining", "late age x lifespan")
+
+crossed_signif_plot2 <- crossed_signif_compare %>%
+  filter(term1 %in% select_terms, term2 %in% select_terms) %>%
+  mutate(
+    nlog10pvalue = -1*log10(p.value),
+    nlog10pvalue = pmin(nlog10pvalue, 30),
+    ordered_term1 = fct_rev(ordered_term1),
+    enrichment = round(estimate, 1),
+    cell_label = ifelse(
+      p.value < 1e-5,
+      glue::glue("p(x|y)={round(Pr_1_2, 2)}\np(y|x)={round(Pr_2_1, 2)}"),
+      NA
+    )) %>%
+  ggplot(aes(x = ordered_term1, y = ordered_term2, fill = nlog10pvalue, label = cell_label)) +
+  geom_raster() +
+  geom_text(aes(color = ifelse(nlog10pvalue > 20, "gray20", "gray90"))) +
+  scale_fill_viridis_c(expression(-log[10]~"p-value"), option = "magma", breaks = c(10, 20, 30), labels = c("10", "20", ">30")) +
+  scale_color_identity() +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title = element_blank(),
+    legend.position = "bottom",
+    axis.text = element_text(size = 12)
+    ) +
+  expand_limits(fill = 30)
+  
+crossed_signif_plot2
+create_and_upload_figure(
+  name = "crossed_significance_subset",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4",
+  width = 8,
+  height = 8,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+
+```
+
+## GSEA-term Affinities
+
+```{r pathways_by_terms}
+term_affinity_terms <- c(
+  "age",
+  "fraction of life lived",
+  #"lifespan",
+  "lifespan remaining",
+  "late age x lifespan",
+  "lifespan | age",
+  "early age (fc)",
+  "late age (fc)",
+  "late age x lifespan (fc)"
+  )
+
+top_pathway_union <- figure_3_out$gsea_hits %>%
+  # drop degenerate GO categories
+  filter(is.na(distinct_term) | distinct_term == TRUE) %>%
+  filter(term %in% term_affinity_terms) %>%
+  arrange(qvalue) %>%
+  group_by(data_modality, term) %>%
+  #slice(1:5) %>%
+  ungroup() %>%
+  distinct(data_modality, category, value) %>%
+  left_join(
+    figure_3_out$go_hit_colorscheme %>% 
+      distinct(
+        value = category_value,
+        category_label,
+        category_general_label,
+        category_color
+        ),
+    by = "value",
+    multiple = "all"
+  ) %>%
+  dplyr::mutate(
+    category_label = ifelse(!is.na(category_label), category_label, stringr::str_trunc(value, 40)),
+    category_general_label = ifelse(!is.na(category_general_label), category_general_label, category_label),
+    category_color = ifelse(!is.na(category_color), category_color, "gray50")
+  )
+
+# add all members
+top_pathways_for_term_affinity <- top_pathway_union %>%
+  left_join(
+    figure_3_out$go_category_members,
+    by = c("category", "value")
+  )
+
+# add just members which are diffex
+# when the term is significant
+pathway_signif_subset <- figure_3_out$gsea_hits %>%
+  semi_join(top_pathway_union, by = c("data_modality", "category", "value")) %>%
+  # unnest the significant hits for each pathway
+  # irrespective of the term they are associated with
+  unnest(category_hits_df) %>%
+  filter(term %in% term_affinity_terms) %>%
+  distinct(data_modality, category, value, data_type, groupId)
+
+# define all features changing with g(age, lifespan)
+
+all_aging_features <- figure_3_out$feature_signif_w_alt_terms %>%
+  dplyr::filter(
+    term %in% term_affinity_terms,
+    case_when(
+      q.value < 0.1 ~ TRUE,
+      # rescue lipid unknowns
+      is.na(q.value) & pvalue_bs < 0.0001 ~ TRUE,
+      .default = FALSE
+    ))
+
+# add categories for "other" molecules which are associated
+# with the affinity terms but not represented in pathways
+
+other_aging_features <- all_aging_features %>%
+  dplyr::distinct(data_modality, data_type, groupId, feature_name) %>%
+  anti_join(
+    pathway_signif_subset, by = c("data_type", "groupId")
+  ) %>%
+  dplyr::mutate(
+    category = "other",
+    value = glue::glue("Other {stringr::str_to_title(data_modality)}"),
+    # split metabolites into knowns and unknowns
+    value = dplyr::case_when(
+      data_modality == "metabolomics" & stringr::str_detect(feature_name, "^\\([-+]\\) unk") ~ "Metabolomics Unknowns",
+      data_modality == "metabolomics" ~ "Metabolomics Knowns",
+      TRUE ~ value
+    ),
+    category_label = value,
+    category_general_label = value,
+    category_color = case_when(
+      data_modality == "metabolomics" ~ "red3",
+      data_modality == "proteomics" ~ "royalblue1",
+      data_modality == "lipidomics" ~ "limegreen"
+      )) %>%
+  dplyr::select(-feature_name)
+    
+top_pathways_for_term_affinity <- top_pathways_for_term_affinity %>%
+  dplyr::bind_rows(
+    # add misc categories af a age-associated proteins, metabolites and lipids
+    other_aging_features %>% distinct(
+      data_modality,
+      category,
+      value,
+      category_label,
+      category_general_label,
+      category_color)
+    ) %>%
+  rename(all_members = members) %>%
+  left_join(
+    pathway_signif_subset %>%
+      dplyr::bind_rows(
+        other_aging_features %>%
+          dplyr::select(-category_label, -category_general_label, -category_color)
+      ) %>%
+      nest(diffex_members = c(data_type, groupId)),
+    by = c("data_modality", "category", "value")
+  )
+```
+
+
+```{r bootstrap_relative_support}
+bootstrap_relative_prob <- function (category_data, nbs = 1000) {
+  
+  purrr::map(
+    seq(nbs),
+    ~ category_data %>%
+      dplyr::sample_n(size = dplyr::n(), replace = TRUE) %>%
+      mutate(bs_num = .x) %>%
+      unnest(feature_model_results)
+    ) %>%
+    # combine all bootstraps
+    dplyr::bind_rows() %>%
+    # sum up each model's AIC across features
+    group_by(bs_num, model_name) %>%
+    summarize(
+      aic_sum = sum(AICc),
+      .groups = "drop"
+    ) %>%
+    # summarize the relative fits of models for each bootstrap
+    group_by(bs_num) %>%
+    mutate(
+      relative_lik = exp((min(aic_sum) - aic_sum)/2),
+      relative_prob = relative_lik / sum(relative_lik)
+    )
+}
+
+# load model AICs on a per-feature, per-model basis
+go_category_model_fits <- top_pathways_for_term_affinity %>%
+  # perform the same analysis using all members (members) and
+  # only those members which are diffex for some term (diffex_members)
+  gather(membership_type, members, all_members, diffex_members) %>%
+  unnest(members) %>%
+  # add all models
+  inner_join(
+    model_summaries,
+    by = c("data_type", "groupId"),
+    relationship = "many-to-many"
+    ) %>%
+  filter(stringr::str_detect(model_name, "^cross"))
+
+# calculate relative support of all models for each GO term
+term_affinities <- go_category_model_fits %>%
+  group_by(membership_type, data_modality, category, value, category_label, category_general_label, category_color, model_name) %>%
+  summarize(
+    aic_sum = sum(AICc),
+    .groups = "drop"
+    ) %>%
+  group_by(membership_type, data_modality, category, value) %>%
+  mutate(
+    relative_lik = exp((min(aic_sum) - aic_sum)/2),
+    relative_prob = relative_lik / sum(relative_lik)
+    ) %>%
+  ungroup()
+
+model_comparison_uncertainty_cache_path <- file.path(params$cache_dir, "model_comparison_uncertainty_cache.Rds")
+if (file.exists(model_comparison_uncertainty_cache_path) && !overwrite) {
+  model_comparison_uncertainty <- readRDS(model_comparison_uncertainty_cache_path)
+} else {
+  
+  # bootstrap all models that we may want to work with
+  model_comparison_uncertainty <- go_category_model_fits %>%
+    nest(feature_model_results = -c(data_modality:groupId)) %>%
+    nest(category_data = c(data_type, groupId, feature_model_results)) %>%
+    dplyr::mutate(
+      bootstrapped_rel_prob = purrr::map(
+        category_data,
+        bootstrap_relative_prob
+      )
+    ) %>%
+    select(-category_data) %>%
+    unnest(bootstrapped_rel_prob)
+  
+  saveRDS(model_comparison_uncertainty, model_comparison_uncertainty_cache_path)
+}
+```
+
+```{r visualize_relative_model_probs, fig.height = 8, fig.width = 10}
+# combine model relative supports with bootstrap estimates
+# filter to a set of working models (this could be done above to speed things up)
+
+effect_category_types <- tibble::tribble(
+  ~ mini_model_name, ~ aging_archetype, ~ gsea_term,
+  "lifespan", "lifespan", list("lifespan | age"),
+  "age", "chronological age", list("early age (fc)", "late age (fc)"),
+  "int-age", "chronological age", list("age"),
+  "fll", "fraction of life lived", list("fraction of life lived"),
+  "age x lifespan", "age x lifespan", list("late age x lifespan (fc)"),
+  "int-age x lifespan", "age x lifespan", list("age x lifespan"),
+  "lifespan-remaining", "lifespan-remaining", list("lifespan remaining")
+) %>%
+  dplyr::mutate(
+    model_name = glue::glue("cross-sectional lm ({mini_model_name}), no DDM"),
+    aging_archetype = factor(aging_archetype, levels = unique(aging_archetype))
+  )
+
+standardized_term_affinities <- dplyr::bind_rows(
+  term_affinities %>% dplyr::mutate(bs_num = -1),
+  model_comparison_uncertainty
+) %>%
+  mutate(
+    mini_model_name = stringr::str_match(model_name, "\\(([a-z +-:]+)\\)")[,2]
+    ) %>%
+  # reduce to models of interest
+  inner_join(effect_category_types %>% select(mini_model_name, aging_archetype), by = "mini_model_name") %>%
+  # take the minimal AIC over aging_archetype
+  dplyr::group_by(membership_type, data_modality, category, value, category_label, category_general_label, category_color, bs_num, aging_archetype) %>%
+  dplyr::summarize(aic_sum = min(aic_sum), .groups = "drop") %>%
+  group_by(data_modality, category, value, membership_type, bs_num) %>%
+  mutate(
+    relative_lik = exp((min(aic_sum) - aic_sum)/2),
+    relative_prob = relative_lik / sum(relative_lik)
+  ) %>%
+  ungroup()
+
+term_affinity_ci <- standardized_term_affinities %>%
+  # drop the observed relative model prob
+  dplyr::filter(bs_num > 0) %>%
+  nest(rel_prob_dist = c(bs_num, aic_sum, relative_lik, relative_prob)) %>%
+  mutate(prob_dist_summary = purrr::map(
+    rel_prob_dist,
+    ~ as_tibble(as.list(quantile(.x$relative_prob, probs = c(0.025, 0.5, 0.975))))
+  )) %>%
+  dplyr::select(-rel_prob_dist) %>%
+  unnest(prob_dist_summary) #%>%
+  # drop models which are never relevant
+  #group_by(model_name) %>%
+  #filter(any(`97.5%` > 0.5)) %>%
+  #ungroup()
+
+term_affinity_summaries <- standardized_term_affinities %>%
+  dplyr::filter(bs_num == -1) %>%
+  dplyr::select(membership_type:category_color, aging_archetype, relative_prob) %>%
+  left_join(
+    term_affinity_ci %>%
+      dplyr::select(membership_type, data_modality, category, value, aging_archetype, `2.5%`, `50%`, `97.5%`),
+    by = c("membership_type", "data_modality", "category", "value", "aging_archetype")
+  ) %>%
+  # seelct membership type
+  dplyr::filter(membership_type == "diffex_members")
+
+# order by FFL attributions
+aging_archetype_orders <- tibble::tibble(
+  aging_archetype = c("lifespan", "lifespan-remaining", "chronological age", "fraction of life lived", "age x lifespan"),
+  order_weight = 1:5
+)
+
+ordered_terms_by_fll <- term_affinity_summaries %>%
+  left_join(aging_archetype_orders, by = "aging_archetype") %>%
+  select(category_label, category_color, aging_archetype:order_weight) %>%
+  gather(prob_measure, prob, -category_label, -category_color, -aging_archetype, -order_weight) %>%
+  mutate(w_prob = prob * order_weight) %>%
+  group_by(category_label, category_color) %>%
+  summarize(w_prob_sum = sum(w_prob), .groups = "drop") %>%
+  arrange(w_prob_sum) %>%
+  dplyr::mutate(
+    hex = gplots::col2hex(category_color),
+    category_label_md = glue::glue("<span style='color:{hex}'><b>{category_label}</b></span>"),
+    category_label_fct = factor(category_label_md, levels = category_label_md),
+    )
+
+term_affinities_grob <- term_affinity_summaries %>%
+  dplyr::left_join(
+    ordered_terms_by_fll %>%
+      dplyr::select(category_label, category_label_fct),
+    by = "category_label"
+  ) %>% 
+  ggplot(
+  aes(x = category_label_fct, color = category_color)) +
+  geom_linerange(aes(ymin = `2.5%`, ymax = `97.5%`), linewidth = 1) +
+  geom_point(aes(y = `50%`), shape = 3, size = 3) +
+  geom_point(aes(y = relative_prob), shape = 5, size = 3) +
+  scale_color_identity() +
+  facet_grid(aging_archetype ~ .) +
+  scale_x_discrete(NULL) +
+  scale_y_continuous("Relative support of aging mode") +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(angle = 60, hjust = 1)
+  )
+
+term_affinities_grob
+create_and_upload_figure(
+  name = "term_affinities_grob",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 10,
+  height = 8,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Illustration of aggregating pathways
+
+```{r pathway_rollup, fig.height = 6, fig.width = 16}
+pathway_rollup_data <- go_category_model_fits %>%
+  filter(category_label == "IGF Signaling", membership_type == "diffex_members") %>%
+  inner_join(effect_category_types %>% select(aging_archetype, model_name), by = "model_name") %>%
+  group_by(aging_archetype, groupId) %>%
+  arrange(AIC) %>%
+  slice(1) %>%
+  group_by(groupId) %>%
+  mutate(AICc_relative = AICc - min(AICc)) %>%
+  ungroup() %>%
+  arrange(AICc_relative) %>%
+  left_join(features, by = c("data_modality", "groupId")) %>%
+  mutate(
+    feature_label = dplyr::case_when(
+      feature_label %in% c("Igfbp5", "Pcsk9", "Afp") ~ feature_label,
+      TRUE ~ "other"
+    ),
+    feature_label = factor(feature_label, levels = c("Pcsk9", "Afp", "Igfbp5", "other"))
+  )
+
+plot_rollup <- function (pathway_rollup_data) {
+  probs <- pathway_rollup_data %>%
+    group_by(aging_archetype) %>%
+    summarize(aic_sum = sum(AICc_relative), .groups = "drop") %>%
+    mutate(
+      relative_lik = exp((min(aic_sum) - aic_sum)/2),
+      relative_prob = relative_lik / sum(relative_lik),
+      prob_label = glue::glue("Pr(model) = {round(relative_prob, 4)}")
+    ) 
+  
+  pathway_rollup_data %>%
+    ggplot(aes(x = aging_archetype, y = AICc_relative)) +
+    geom_bar(stat = "identity", color = "white", aes(fill = feature_label)) +
+    geom_text(data = probs, aes(x = aging_archetype, y = aic_sum, label = prob_label), hjust = 0) +
+    coord_flip() +
+    scale_y_continuous("AICc - min(AICc)") +
+    scale_x_discrete("", limits=rev) +
+    scale_fill_brewer("Protein", palette = "Set2") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+
+pw_rollup <- plot_rollup(pathway_rollup_data) + expand_limits(y = 200) + ggtitle("**IGF Signaling** relative support for *aging archetypes*") + theme(plot.title = ggtext::element_markdown())
+pw_rollup_just_pcsk9 <- plot_rollup(pathway_rollup_data %>% filter(feature_label == "Pcsk9")) + expand_limits(y = 40) + theme(legend.position = "none") + ggtitle("**Pcsk9** relative support for *aging archetypes*") + theme(plot.title = ggtext::element_markdown())
+
+pw_rollup_just_pcsk9 + pw_rollup +
+  plot_layout(
+    widths = c(2, 4),
+    design = c(
+    "
+    AB
+    "
+  ))
+
+create_and_upload_figure(
+  name = "pw_rollup_igf",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 16,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Select Representative Molecules Associated with Specific Pathways and/or Regression Terms
+
+```{r assign_aging_features_to_fxnl_category}
+# assign each aging/longevity-associated feature to a single category and its associated mode of aging
+pathways_to_aging_archetypes <- top_pathways_for_term_affinity %>%
+  # add each terms mode of aging
+  dplyr::left_join(
+    term_affinity_summaries %>%
+      group_by(category_label) %>%
+      dplyr::arrange(desc(relative_prob)) %>%
+      slice(1) %>%
+      dplyr::select(category_label, aging_archetype),
+    by = "category_label"
+  ) %>%
+  # add models associated with aging_archetype
+  dplyr::left_join(
+    effect_category_types,
+    by = "aging_archetype",                                                                      
+    relationship = "many-to-many"
+    )
+
+# associations between each pathway and their aging archetype
+pathway_assoc_strength <- pathways_to_aging_archetypes %>%
+  # split gsea terms across multiple rows (for aging where a single model maps to two terms)
+  unnest_longer(gsea_term) %>%
+  # add GSEA enrichments for each term-model association
+  dplyr::left_join(
+    figure_3_out$gsea_hits %>%
+      dplyr::select(term, data_modality, category, value, qvalue_aging_archetype = qvalue),
+    by = c("gsea_term" = "term", "data_modality", "category", "value")
+  ) %>%
+  # qvalue for association within the "aging modes"
+  dplyr::select(
+    data_modality,
+    category,
+    value,
+    category_label,
+    qvalue_aging_archetype
+    ) %>%
+  arrange(qvalue_aging_archetype) %>%
+  group_by(data_modality, category, value, category_label) %>%
+  slice(1) %>%
+  dplyr::left_join(
+    # qvalue for association among all "aging modes"
+    figure_3_out$gsea_hits %>%
+      semi_join(effect_category_types %>% unnest_longer(gsea_term), by = c("term" = "gsea_term")) %>%
+      group_by(data_modality, category, value) %>%
+      arrange(qvalue) %>%
+      slice(1) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(data_modality, category, value, qvalue_min_overall = qvalue),
+    by = c("data_modality", "category", "value")
+  ) %>%
+  ungroup() %>%
+  dplyr::select(
+    category_label,
+    qvalue_aging_archetype,
+    qvalue_min_overall
+    )
+
+# top aging mode for each feature
+aging_feature_specific_archetypes <- all_aging_features %>%
+  rename(diffex_model_name = model_name) %>%
+  # map diffex term to xs-model where AICs can be compared to
+  # assign features associated with multiple terms to the one
+  # with lower AIC
+  left_join(
+    effect_category_types %>%
+      unnest_longer(gsea_term) %>%
+      rename(aic_model_name = model_name)
+    ,
+    by = c("term" = "gsea_term")
+  ) %>%
+  # add AIC for the lm used for model comparison
+  left_join(
+    model_summaries %>%
+      select(data_type, groupId, aic_model_name = model_name, AICc),
+    by = c("data_type", "groupId", "aic_model_name")
+  ) %>%
+  arrange(AICc) %>%
+  group_by(data_type, groupId) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # only retain useful 
+  select(term, data_type, groupId, pvalue_ols, estimate, pvalue_bs, q.value, feature_aging_archetype = aging_archetype) %>%
+  mutate(change_w_age = case_when(
+    # archetyped where sign is flipped
+    feature_aging_archetype %in% c("age x lifespan", "lifespan-remaining", "lifespan") & estimate < 0 ~ "up",
+    feature_aging_archetype  %in% c("age x lifespan", "lifespan-remaining", "lifespan") & estimate > 0 ~ "down",
+    estimate < 0 ~ "down",
+    estimate > 0 ~ "up"
+  ))
+  
+longevity_features_to_top_pathway <- pathways_to_aging_archetypes %>%
+  dplyr::left_join(pathway_assoc_strength, by = "category_label") %>%
+  dplyr::select(-all_members) %>%
+  tidyr::unnest(diffex_members) %>%
+  # add top aging mode for each category
+  inner_join(model_summaries, by = c("data_type", "groupId", "model_name"), multiple = "all") %>%
+  # assign the feature to the category where it is best
+  dplyr::group_by(data_modality, data_type, groupId) %>%
+  arrange(AIC, qvalue_aging_archetype, qvalue_min_overall) %>%
+  summarize(
+    go_aging_archetype = aging_archetype[1],
+    gsea_term = gsea_term[1],
+    category = category[1],
+    value = value[1],
+    qvalue_aging_archetype = qvalue_aging_archetype[1],
+    qvalue_min_overall = qvalue_min_overall[1],
+    all_category_label = paste(sort(unique(category_label)), collapse = ' & '),
+    category_label = category_label[1],
+    all_category_general_label = paste(sort(unique(category_general_label)), collapse = ' & '),
+    category_general_label = category_general_label[1],
+    category_color = category_color[1],
+    .groups = "drop"
+    ) %>%
+  # for each feature, add its effect significance in the relevant model
+  unnest_longer(gsea_term) %>%
+  left_join(
+    figure_3_out$feature_signif_w_alt_terms %>%
+      dplyr::select(data_type, groupId, term, feature_qvalue_for_category_archetype = q.value),
+    by = c("data_type", "groupId", "gsea_term" = "term")
+  ) %>%
+  group_by(data_type, groupId) %>%
+  arrange(feature_qvalue_for_category_archetype) %>%
+  slice(1) %>%
+  dplyr::ungroup() %>%
+  # add feature labels
+  left_join(
+    features %>%
+      dplyr::select(data_type, groupId, feature_name, feature_label),
+    by = c("data_type", "groupId")
+  ) %>%
+  left_join(
+    # add feature_specific archetypes
+    aging_feature_specific_archetypes,
+    by = c("data_type", "groupId")
+  )
+```
+
+
+```{r choose_select_lifespan_hits}
+longevity_viable_highlights <- longevity_features_to_top_pathway %>%
+  dplyr::filter(feature_qvalue_for_category_archetype < 0.1)
+  
+# drop hits where a feature is associated with multiple genes and only
+# a subset of features are associated with the term
+longevity_proteins <- longevity_features_to_top_pathway %>%
+  select(data_type, groupId, feature_aging_archetype) %>%
+    # add gene name
+    inner_join(
+      features %>% select(data_type, groupId, gene) %>% filter(!is.na(gene)),
+      by = c("data_type", "groupId")
+    )
+
+discordant_genes <- list(
+  features %>%
+    # matches a longevity gene
+    dplyr::semi_join(longevity_proteins, by = c("data_type", "gene")) %>%
+    # does not match a longevity feature
+    dplyr::anti_join(longevity_proteins, by = c("data_type", "groupId")) %>%
+    {.$gene},
+    # assigned to functional categories with different aging modes
+  longevity_proteins %>%
+    distinct(gene, feature_aging_archetype) %>%
+    group_by(gene) %>%
+    filter(n() > 1) %>%
+    {.$gene}
+  ) %>%
+  unlist() %>%
+  unique()
+  
+longevity_viable_highlights <- longevity_viable_highlights %>%
+  dplyr::semi_join(
+    features %>%
+      dplyr::filter(!(gene %in% discordant_genes)),
+    by = c("data_type", "groupId")
+  )
+  
+top_longevity_hits_in_pathways <- longevity_viable_highlights %>%
+  # retain just the stronger association among longevity terms
+  group_by(go_aging_archetype, category_general_label) %>%
+  arrange(feature_qvalue_for_category_archetype, pvalue_bs, pvalue_ols) %>%
+  slice(1:2) %>%
+  ungroup()
+
+knitr::kable(top_longevity_hits_in_pathways) %>%
+  kableExtra::kable_minimal()
+```
+
+## Visualize Age vs. Age x Lifespan vs. FLL as a Ternary Diagram
+
+```{r ternary, fig.height = 7, fig.width = 15}
+# filter terms which are dominated by lifespan remaining or age-independent lifespan
+non_aging_terms <- term_affinity_summaries %>%
+  dplyr::filter(
+    aging_archetype %in% c("lifespan", "lifespan-remaining"),
+    relative_prob > 0.5
+  )
+
+aging_term_subset <- standardized_term_affinities %>%
+  dplyr::filter(
+    bs_num == -1,
+    membership_type == "diffex_members"
+    ) %>%
+  dplyr::filter(!(aging_archetype %in% c("lifespan", "lifespan-remaining"))) %>%
+  dplyr::anti_join(non_aging_terms, by = "value") %>%
+  # renormalize relative probs
+  dplyr::group_by(membership_type, data_modality, category, value, category_label) %>%
+  dplyr::mutate(relative_prob = relative_prob / sum(relative_prob)) %>%
+  dplyr::ungroup()
+  
+term_spread_diag <- aging_term_subset %>%
+  dplyr::select(data_modality:category_color, aging_archetype, relative_prob) %>%
+  tidyr::spread(aging_archetype, relative_prob)
+  
+# merge terms which are right at vertices
+ternary_data <- term_spread_diag %>%
+  mutate(
+    hex = gplots::col2hex(category_color),
+    label = glue::glue("<span style='color:{hex}'><b>{category_label}</b></span>")
+  ) %>%
+  # merge categories which are right at the vertices
+  mutate(
+    merge_category = case_when(
+      `age x lifespan` > 0.97 ~ "age x lifespan",
+      `fraction of life lived` > 0.97 ~ "fraction of life lived",
+      `chronological age` > 0.97 ~ "chronological age",
+      TRUE ~ category_label
+    )
+  ) %>%
+  arrange(category_general_label) %>%
+  group_by(merge_category) %>%
+  summarize(
+    label = paste(label, collapse = "<br>"),
+    `chronological age` = mean(`chronological age`),
+    `fraction of life lived` = mean(`fraction of life lived`),
+    `age x lifespan` = mean(`age x lifespan`),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    x = `chronological age` + 0.5 * `age x lifespan`,
+    y = sqrt(3)/2 * `age x lifespan`
+    ) %>%
+  # relocate some of the larger merged categories
+  mutate(
+    x_alt = ifelse(merge_category == "age x lifespan", 0.75, x),
+    hjust = dplyr::case_when(
+      merge_category %in% c("chronological age", "age x lifespan") ~ 0,
+      TRUE ~ 1
+    ),
+    vjust = dplyr::case_when(
+      merge_category %in% c("fraction of life lived", "chronological age") ~ 0,
+      merge_category == "age x lifespan" ~ 1,
+      TRUE ~ 0.5
+    )
+  )
+
+# look at the relative model support of individual features
+feature_relative_model_pr <- model_summaries %>%
+  inner_join(
+    effect_category_types %>%
+      select(aging_archetype, model_name) %>%
+      semi_join(aging_term_subset, by = "aging_archetype"),
+    by = "model_name"
+  ) %>%
+  group_by(data_type, groupId) %>%
+  mutate(
+    relative_lik = exp((min(AICc) - AICc)/2),
+    relative_prob = relative_lik / sum(relative_lik)
+  ) %>%
+  group_by(data_type, groupId, aging_archetype) %>%
+  summarize(relative_prob = sum(relative_prob), .groups = "drop") %>%
+  spread(aging_archetype, relative_prob)
+
+aging_ternary_features <- longevity_features_to_top_pathway %>%
+  filter(feature_aging_archetype %in% c("chronological age", "fraction of life lived", "age x lifespan")) %>%
+  left_join(feature_relative_model_pr, by = c("data_type", "groupId")) %>%
+  mutate(
+    x = `chronological age` + 0.5 * `age x lifespan`,
+    y = sqrt(3)/2 * `age x lifespan`
+  )
+
+functional_category_colors <- aging_ternary_features %>%
+  distinct(data_modality, qvalue_min_overall, category_general_label, category_color) %>%
+  mutate(data_modality = factor(data_modality, levels = c("proteomics", "metabolomics", "lipidomics"))) %>%
+  arrange(data_modality, qvalue_min_overall) %>%
+  group_by(category_general_label) %>%
+  slice(1) %>%
+  arrange(data_modality, qvalue_min_overall) 
+  
+ternary_grob <- ternary_data %>%
+  ggplot(aes(x = x, y = y)) +
+  geom_polygon(data = tibble::tribble(
+    ~ x, ~ y,
+    0, 0,
+    0.5, sqrt(3)/2,
+    1, 0
+  ), fill = "white", color = "gray70", linewidth = 2) +
+  geom_point(data = aging_ternary_features, aes(color = category_color), size = 0.8) +
+  #geom_point(size = 4, color = "black") +
+  geom_segment(x = 0.5, xend = 0.75, y = sqrt(3)/2, yend = sqrt(3)/2, linetype = "dotdash", color = "gray70") +
+  ggtext::geom_richtext(aes(label = label, hjust = hjust, vjust = vjust, x = x_alt), fill = "white") +
+  annotate("text", x = -0.05, y = -0.05, label = "Fraction of Life Lived", size = 5) +
+  annotate("text", x = 0.5, y = sqrt(3)/2+0.05, label = "Age x Lifespan", size = 5) +
+  annotate("text", x = 1.05, y = -0.05, label = "Chronological Age", size = 5) +
+  expand_limits(x = c(-0.5, 1.5)) +
+  scale_color_identity() +
+  theme_void() +
+  theme(text = element_text(size = 9))
+
+ternary_grob
+create_and_upload_figure(
+  name = "ternary_grob",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4",
+  width = 15,
+  height = 7,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Extreme examples of FLL vs. Age vs. Age x Lifespan
+
+```{r distinctive_aging, fig.width = 18, fig.height = 10}
+distinctive_aging_features <- top_longevity_hits_in_pathways %>%
+  dplyr::filter(
+    go_aging_archetype %in% c("age x lifespan", "fraction of life lived", "chronological age")
+  ) %>%
+  # look at all pathways for the top hits
+  crossing(effect_category_types %>%
+             select(
+               query_aging_archetype = aging_archetype,
+               query_model_name = model_name
+               )) %>%
+  left_join(
+    model_summaries,
+    by = c("data_type", "groupId", "query_model_name" = "model_name"),
+    multiple = "all"
+    ) %>%
+  # return the best fitting cross-sectional model for each feature
+  group_by(query_aging_archetype, data_type, groupId) %>%
+  arrange(AICc) %>%
+  slice(1) %>%
+  group_by(data_type, groupId) %>%
+  arrange(AICc) %>%
+  mutate(aic_delta = AICc[2] - AIC[1]) %>%
+  dplyr::slice(1) %>%
+  dplyr::filter(go_aging_archetype == query_aging_archetype) %>%
+  group_by(go_aging_archetype) %>%
+  arrange(desc(aic_delta)) %>%
+  slice(1:2)
+  
+feature_subset <- distinctive_aging_features$feature_label
+
+aging_ex <- plot_aging(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$aging + theme(legend.position = "none") + labs(title = NULL) + theme(legend.position = "none")
+age_x_lifespan_ex <- plot_age_by_lifespan(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$age_by_lifespan + labs(title = NULL) + theme(legend.position = "none")
+fll_ex <- plot_fraction_of_life_lived(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$fraction_of_life_lived + labs(title = NULL)
+
+x <- age_x_lifespan_ex / aging_ex / fll_ex  &
+  guides(color=guide_legend(override.aes = list(size=5)))
+  
+x + 
+  plot_layout(guides = "collect")
+
+create_and_upload_figure(
+  name = "distinctive_aging_features",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 18,
+  height = 10,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Export Results
+
+```{r export}
+figure_4_out <- list()
+
+figure_4_out$longevity_features_to_top_pathway <- longevity_features_to_top_pathway
+figure_4_out$top_longevity_hits_in_pathways <- top_longevity_hits_in_pathways
+figure_4_out$top_pathways_for_term_affinity <- top_pathways_for_term_affinity
+figure_4_out$term_affinity_summaries <- term_affinity_summaries
+
+saveRDS(figure_4_out, file = file.path(params$cache_dir, "figure_4_out.RDS"))
+```

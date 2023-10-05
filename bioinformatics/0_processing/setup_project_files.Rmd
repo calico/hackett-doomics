@@ -1,0 +1,559 @@
+---
+title: "Setup Project Files"
+author: "Sean Hackett"
+date: "6/15/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# setup drive/sheets authentication
+clamshell::configure_google_access()
+DO_drive_path <- googledrive::as_id("1RTEt3GeUt4h4Z918FfoAAvfwywNxtxPW")
+# add mysql connections
+standard_databases <- clamshell::configure_db_access()
+
+nfs_root = Sys.getenv("doomics_zfs_root")
+annotations_dir <- file.path(nfs_root, "annotations")
+met_dataset_path = Sys.getenv("met_dataset_path")
+
+# source utils
+source("utils_setup_project_files.R")
+
+library(dplyr)
+```
+
+    1. Move processed datasets to a common location
+    2. Remove peakgroups whose abundances are not elevated in biological samples
+         w.r.t. negative controls. This decreases the number of features to
+         be manually annotated.
+    3. Reduce datasets to a tractable number of samples and copy those samples
+         to google drive.
+    4. Split reduced lipidomics (M004A and M005A) datasets by set so peak
+         annotation of sets can occur independently (since alignment was poor).
+    5. Format manual annotations and find peakgroups in the reduced files
+         corresponding to the annotations if they exist. An annotation should
+         match if the curation was of a peakdetector peakgroup, while a
+         bookmark created using the MAVEN GUI may not be perfectly reflected
+         in an existing peakgroup. If peakgroup annotations do match then 
+         the annotation can be transferred from the reduced dataset to the
+         full dataset (since they have the same peakgroups).
+    6. Some annotated peakgroups are not found (or poorly match) among the
+         peakgroups in the reduced dataset. To quantify these features,
+         borderline peakgroup matches are first dropped. Then, unrepresented
+         peakgroups are extracted as EICs about manually annotated peakgroups
+         in the full dataset.
+    7. Split full annotated datasets by set
+
+# Setup
+
+```{r dataset_prep}
+processed_path = file.path(nfs_root, "data", "1_processed")
+if (!file.exists(processed_path)) {
+  dir.create(processed_path)
+}
+
+reduced_path = file.path(nfs_root, "data", "2_reduced")
+if (!file.exists(reduced_path)) {
+  dir.create(reduced_path)
+}
+
+datasets = tibble::tribble(
+  ~ method, ~ raw_db,
+  "M001A", file.path(met_dataset_path, "M001A-set123", "M001A-set123_mzkitchen_v2_16_output_Mon_Aug_10_23-32-05_PDT_2020", "M001A-set123.mzrollDB"),
+  "M002A", file.path(met_dataset_path, "M002A-set123", "M002A-set123_mzkitchen_v2_16_output_Tue_Aug_11_21-34-28_PDT_2020", "M002A-set123.mzrollDB"),
+  "M004A", file.path(met_dataset_path, "M004A-set123", "M004A-set123_mzkitchen_v10_output_Sat_Jan__4_05-32-22_PST_2020", "M004A-set123.mzrollDB"),
+  "M005A", file.path(met_dataset_path, "M005A-set123", "M005A-set123_mzkitchen_v9_output_Fri_Nov_22_08-54-31_PST_2019", "peakdetector.mzrollDB")
+  ) %>%
+  dplyr::mutate(
+    # full working files
+    processed_db = file.path(processed_path, paste0(method, "_processed.mzrollDB")),
+    # smaller mzrolls for annotation
+    reduced_db = file.path(reduced_path, paste0(method, "_reduced.mzrollDB"))
+    )
+
+missing_datasets = datasets %>%
+  dplyr::mutate(exists = file.exists(raw_db)) %>%
+  dplyr::filter(!exists)
+
+if (nrow(missing_datasets) != 0) {
+  stop (glue::glue("{nrow(missing_datasets)} datasets are missing at paths: {paste(missing_datasets$raw_db, collapse = ', ')}"))
+}
+
+# Split reduced lipids into two files to help with annotation
+# since some peakgroups couldn't be aligned across set1/2 and set3
+split_guide <- tibble::tribble(~ label, ~ regex,
+                               "split_12", "set[12]",
+                               "split_3", "set[3]")
+
+reduced_split_mzrolls <- datasets %>%
+  dplyr::filter(method %in% c("M004A", "M005A")) %>%
+  tidyr::crossing(split_guide) %>%
+  dplyr::mutate(
+    # split and reduced for manual annotation
+    reduced_split_out = file.path(reduced_path, paste0(method, "_reduced_", label, ".mzrollDB")),
+    # split to apply annootations
+    split_out = file.path(processed_path, paste0(method, "_", label, ".mzrollDB"))
+    )
+```
+
+# Move peakdetector results into the project folder (Complete)
+
+```{r setup_processed, eval = FALSE}
+datasets %>%
+  {purrr::walk2(.$raw_db, .$processed_db, authutils::sqlite_copy, overwrite = TRUE)}
+```
+
+# Remove peakgroups which are not enriched in biological samples (Complete)
+
+This step is used to reduce the number of peakgroups which need to be manually annotated
+
+```{r remove_nobio, eval = FALSE}
+datasets %>%
+  {purrr::walk(.$processed_db, do_filter_nonbio_peakgroups_mzroll)}
+```
+
+# Reduce to a reasonable number of samples (~40) for visual QC (Complete)
+
+```{r reduce, eval = FALSE}
+# copy overwrittable file and reduce to a subset of samples
+# combine these two function together using the copy return code to
+# determine whether to run reduce_do
+
+datasets %>%
+  {purrr::walk2(
+    .$processed_db,
+    .$reduced_db,
+    authutils::sqlite_copy,
+    overwrite = TRUE
+    )}
+
+datasets %>%
+  {purrr::walk(.$reduced_db, reduce_do)}
+```
+
+## Add Annotation Assets to Drive
+
+### Create Assets (Complete)
+
+- reduced .mzrollDB objects with ~40 samples
+- reduced .mzrollDB's split by set1/2 vs. set3 for lipids
+- directory of selected .mzXMLs
+- lipid libraries from mzkitchen run
+
+```{r reduced_mzxmls, eval = FALSE}
+reduced_sample_mzxmls <- datasets %>%
+  dplyr::mutate(samples = purrr::map2(reduced_db, raw_db, hoist_samples)) %>%
+  tidyr::unnest(samples)
+
+# setup mzXML folders
+
+reduced_sample_datasets <- datasets %>%
+  dplyr::select(method) %>%
+  dplyr::mutate(method_dir = paste0(method, "_mzXMLs"),
+                reduced_mxml_dir = file.path(nfs_root, "data", "2_reduced", method_dir))
+                
+reduced_sample_datasets %>%
+  {purrr::walk(.$reduced_mxml_dir, update_reduced_mzxml_dir)}
+
+reduced_sample_mzxmls %>%
+  dplyr::select(method, path) %>%
+  dplyr::left_join(reduced_sample_datasets, by = "method") %>%
+  {purrr::walk2(.$path, .$reduced_mxml_dir, file.copy)}
+```
+
+#### Create reduced-split files (Complete)
+
+```{r reduced_split, eval = FALSE}
+reduced_split_mzrolls %>%
+  {list(from = .$reduced_db,
+        to = .$reduced_split_out,
+        regex = .$regex)} %>%
+  purrr::pwalk(do_copy_split, overwrite = TRUE)
+```
+
+#### Create split files (Complete)
+
+```{r processed_split, eval = FALSE}
+reduced_split_mzrolls %>%
+  {list(from = .$processed_db,
+        to = .$split_out,
+        regex = .$regex)} %>%
+  purrr::pwalk(do_copy_split, overwrite = TRUE)
+```
+
+### Upload Assets (Complete)
+
+```{r reduced_upload, eval = FALSE}
+# copy the reduced dataset and mzXMLs back to googledrive
+
+# add mzrolls
+datasets %>%
+  {purrr::walk(.$reduced_db, googledrive::drive_upload, path = DO_drive_path)}
+
+# add split lipid mzrolls
+reduced_split_mzrolls %>%
+  {purrr::walk(.$reduced_split_out, googledrive::drive_upload, path = DO_drive_path)}
+
+# add mzxmls
+drive_reduced_sample_datasets <- reduced_sample_datasets %>%
+  dplyr::mutate(method_drive = purrr::map(method_dir, update_reduced_mzxml_dir_drive, DO_drive_path = DO_drive_path))
+
+reduced_sample_mzxmls %>%
+  dplyr::select(method, path) %>%
+  dplyr::left_join(drive_reduced_sample_datasets, by = "method") %>%
+  {purrr::walk2(.$path, .$method_drive, googledrive::drive_upload)}
+```
+
+### Add Annotation Libraries (Complete)
+
+```{r libraries, eval = FALSE}
+lipid_libraries <- datasets %>%
+  dplyr::filter(method %in% c("M004A", "M005A")) %>%
+  dplyr::mutate(lib_path = purrr::map2(raw_db, method, function(x, y){
+    libs <- file.path(dirname(x), "libraries")
+    tibble::tibble(lib = list.files(libs)) %>%
+      dplyr::mutate(server_path = file.path(libs, lib),
+                    outfile = glue::glue("{y}_{lib}"))
+  })) %>%
+  tidyr::unnest(lib_path) %>%
+  dplyr::select(server_path, outfile) %>%
+  dplyr::mutate(tmp_file = file.path("/tmp", outfile))
+
+lipid_libraries %>%
+  {purrr::walk2(.$server_path, .$tmp_file, file.copy, overwrite = TRUE)}
+
+lipid_libraries %>%
+  {purrr::walk(.$tmp_file, googledrive::drive_upload, path = DO_drive_path)}
+```
+
+# Annotate
+
+##  Move annotations from Drive to NFS (Complete)
+
+```{r drive_dl, eval = FALSE}
+# copy annotations back to the NFS
+#dir.create(annotations_dir)
+
+# download all annotations from Drive -> annotations_dir
+DO_drive_path %>%
+  googledrive::drive_ls() %>%
+  dplyr::filter(name == "annotations") %>%
+  googledrive::drive_ls() %>%
+  {purrr::walk2(.$name, .$id, function(name,id,outdir) {
+    googledrive::drive_download(googledrive::as_id(id), file.path(outdir, name), overwrite = TRUE)
+  }, outdir = annotations_dir)}
+```
+
+## Patch files which are missing scans
+
+```{r patch_mzrolls}
+reduced_dir <- file.path(nfs_root, "data", "2_reduced")
+
+patching_paths <- tribble(
+  ~ scan_file, ~ annotation_file,
+  file.path(reduced_dir, "M001A_reduced.mzrollDB"), file.path(annotations_dir, "M001A_reduced_NV_20210225.mzrollDB"),
+  file.path(reduced_dir, "M002A_reduced.mzrollDB"), file.path(annotations_dir, "M002A_reduced_NV_20210225.mzrollDB"),
+  file.path(reduced_dir, "M004A_reduced_split_12.mzrollDB"), file.path(annotations_dir, "M004A_reduced_split_12-NV-withUNK.mzrollDB"),
+  file.path(reduced_dir, "M004A_reduced_split_3.mzrollDB"), file.path(annotations_dir, "M004A_reduced_split_3-NV-withUNK.mzrollDB"),
+  file.path(reduced_dir, "M005A_reduced_split_12.mzrollDB"), file.path(annotations_dir, "set12_split_M005_BB.mzrollDB"),
+  file.path(reduced_dir, "M005A_reduced_split_3.mzrollDB"), file.path(annotations_dir, "set3_split_M005_BB.mzrollDB")
+  ) %>%
+  dplyr::mutate(out_file = stringr::str_replace(annotation_file, ".mzrollDB", "_patched.mzrollDB"))
+
+stopifnot(all(file.exists(patching_paths$scan_file)))
+stopifnot(all(file.exists(patching_paths$annotation_file)))
+```
+
+### Add scans to annotation file (Complete)
+
+Fix mzrollDBs so they can be read by clamr.
+
+- add scans
+- fix some variable classes whose conventions have changed
+
+```{r patch_annotations, eval = FALSE}
+# move file with scan to output
+patching_paths %>%
+  {purrr::walk2(.$scan_file, .$out_file, file.copy, overwrite = TRUE)}
+
+# annotate scan-containing file with peaks, peakgroups, samples and compounds
+patching_paths %>%
+  {purrr::walk2(.$annotation_file, .$out_file, patch_malformed_mzrolls)}
+```
+
+## Process Annotation Files (Complete)
+
+- Match metabolite annotations to systematic compound names 
+- Merge peakgroups of the same ion
+- Add these annotations to the annotation .mzrollDB as updated compoundName
+  and adductName.
+
+```{r process_annotations, eval = FALSE}
+additional_smiles <- c(
+  "Glycerol-3-P" = "C([C@H](COP(=O)(O)O)O)O",
+  "Pyruvic acid" = "CC(=O)C(=O)O",
+  "GLYCERATE-20.0:10.0:180.0:80.0:90.0:40.0:30.0:200.0:120.0:140.0:100.0:60.0:50.0" = "O=C(O)[C@@H](O)CO",
+  "L-Tyrosine; LC-ESI-QTOF; MS2; CE" = "N[C@@H](Cc1ccc(O)cc1)C(=O)O",
+  "acetyltaurine" = "CC(=O)NCCS(=O)(=O)O",
+  "D-Glucuronic acid; LC-ESI-QTOF; MS2; CE" = "	O=C(O)[C@H]1O[C@H](O)[C@H](O)[C@@H](O)[C@@H]1O",
+  "Aspartate; LC-ESI-ITFT; MS2; CE 85.0 eV; [M-H]-" = "C([C@@H](C(=O)[O-])[NH3+])C(=O)[O-]",
+  "deaminoneuraminic acid" = "C(C(CC(=O)C(=O)O)O)C(C(C(CO)O)O)O",
+  "TAURINE-20.0:10.0:180.0:80.0:70.0:90.0:40.0:30.0:160.0:200.0:120.0:140.0:100.0:60.0:50.0" = "C(CS(=O)(=O)O)N",
+  "Pyridoxal; LC-ESI-QTOF; MS2; CE" = "Cc1ncc(CO)c(C=O)c1O",
+  "O-Phosphoethanolamine; LC-ESI-QTOF; MS2; CE" = "NCCOP(=O)(O)O",
+  "D-glyceraldehdye-3-phosphate" = "O=CC(O)COP(=O)(O)O",
+  "Taurine; LC-ESI-QTOF; MS2; CE" = "C(CS(=O)(=O)O)N",
+  "Niacinamide; LC-ESI-QTOF; MS2; CE" = "NC(=O)c1cccnc1",
+  "PHOSPHOCHOLINE+20.0:10.0:180.0:80.0:70.0:90.0:40.0:30.0:160.0:200.0:120.0:140.0:100.0:60.0" = "C[N+](C)(C)CCOP(=O)(O)O",
+  "L-prolyl-L-glycine" = "C1C[C@H](NC1)C(=O)NCC(=O)O",
+  "NG-dimethyl-L-arginine" = "CN(C)C(=NCCC[C@@H](C(=O)O)N)N",
+  "NICOTINATE+20.0:10.0:180.0:80.0:70.0:90.0:40.0:30.0:200.0:120.0:140.0:100.0:60.0:50.0" = "C1=CC(=CN=C1)C(=O)[O-]",
+  "Urocanic acid; LC-ESI-QTOF; MS2; CE" = "O=C(O)/C=C/c1c[nH]cn1",
+  "AMP; LC-ESI-QTOF; MS2; CE" = "Nc1ncnc2c1ncn2[C@@H]1O[C@H](COP(=O)(O)O)[C@@H](O)[C@H]1O",
+  "D-MANNOSAMINE" = "C([C@@H]1[C@H]([C@@H]([C@@H](C(O1)O)N)O)O)O"
+)
+
+# annotate the systematic compounds in metabolomics .mzRolls
+patching_paths$out_file %>%
+  purrr::walk(process_annotation_mzroll, standard_databases, additional_smiles)
+```
+
+```{r check_reduced_split_overlap, eval = FALSE}
+check_split_pair_annotation_overlap <- function(
+  annotation_file_12,
+  annotation_file_3,
+  outfile
+) {
+  
+  mzroll_db_con <- clamr::mzroll_db_sqlite(annotation_file_12)
+  compounds_12 <- dplyr::tbl(mzroll_db_con, "peakgroups") %>%
+    dplyr::collect() %>%
+    dplyr::select(adductName, compoundName, compoundDB_set12 = compoundDB) %>%
+    dplyr::mutate(
+      set12 = "present",
+      compoundDB_set12 = ifelse(is.na(compoundDB_set12), "present", compoundDB_set12)
+      )
+  DBI::dbDisconnect(mzroll_db_con)
+  
+  mzroll_db_con <- clamr::mzroll_db_sqlite(annotation_file_3)
+  compounds_3 <- dplyr::tbl(mzroll_db_con, "peakgroups") %>%
+    dplyr::collect() %>%
+    dplyr::select(adductName, compoundName, compoundDB_set3 = compoundDB) %>%
+    dplyr::mutate(
+      set3 = "present",
+      compoundDB_set3 = ifelse(is.na(compoundDB_set3), "present", compoundDB_set3)
+      )
+  DBI::dbDisconnect(mzroll_db_con)
+  
+  coverage_comparison <- compounds_12 %>%
+    dplyr::full_join(compounds_3, by = c("adductName", "compoundName")) %>%
+    dplyr::select(compoundName, adductName, compoundDB_set12, compoundDB_set3) %>%
+    dplyr::arrange(compoundName)
+    
+  coverage_comparison %>%
+    dplyr::count(is.na(compoundDB_set12), is.na(compoundDB_set3)) %>%
+    knitr::kable() %>%
+    print()
+  
+  coverage_comparison %>%
+    readr::write_tsv(file = outfile)
+  }
+
+check_split_pair_annotation_overlap(
+  patching_paths$out_file[3],
+  patching_paths$out_file[4],
+  "~/M004A_set123_overlap.tsv"
+)
+
+check_split_pair_annotation_overlap (
+  patching_paths$out_file[5],
+  patching_paths$out_file[6],
+  "~/M005A_set123_overlap.tsv"
+)
+```
+
+## Use Annotated Reduced Dataset to Annotate groupIds of Reduced Dataset
+
+### Directly Annotate groupIds by matching m/z, rt and correlation
+
+- peakgroup contains all samples
+- very high correlation between annotated and reduced peakgroup across samples
+- high m/z and rt agreement between paired peakgroups
+
+Compounds with dubious match scores or with few samples in the reduced peakgroup will be removed in favor of EICs.
+
+```{r corr_matching}
+peakgroup_annotation_matches <- create_preliminary_peakgroup_annotations_tbl(
+  nfs_root,
+  patching_paths,
+  overwrite = FALSE
+  ) %>%
+  dplyr::mutate(method = paste0(method, "A"))
+
+peakgroup_annotation_matches %>%
+  dplyr::count(out_file, method, status) %>%
+  tidyr::spread(status, n)
+```
+
+# Apply Annotations
+
+## Setup To-Be-Annotated Full Datasets
+
+The peak picking of some knowns by peakdetector was poor, so these features were
+directly extracted as EICs.
+
+```{r apply_annotation_setup}
+annot_dir = file.path(nfs_root, "data", "3_annotated")
+if (!file.exists(annot_dir)) {
+  dir.create(annot_dir)
+}
+
+# create a table mapping each annotated dataset to its full dataset
+#   (containing all samples). For lipids an annotation and full dataset
+#   is set specific.
+annotation_datasets <- dplyr::bind_rows(
+  datasets %>%
+    dplyr::select(method, full_dataset = processed_db, reduced_db) %>%
+    dplyr::filter(method %in% c("M001A", "M002A")),
+  reduced_split_mzrolls %>%
+    dplyr::select(method, label, full_dataset = split_out, reduced_db = reduced_split_out)
+) %>%
+  dplyr::left_join(
+    patching_paths %>%
+      dplyr::select(
+        reduced_db = scan_file,
+        reduced_db_annotations = out_file
+        ),
+    by = "reduced_db"
+    ) %>%
+  dplyr::select(-reduced_db) %>%
+  # add annotation file
+  dplyr::mutate(annotation_db = file.path(annot_dir, paste0(method, ifelse(!is.na(label), paste0("_", label), ""), "_annotated.mzrollDB"))) %>%
+  dplyr::filter(!is.na(reduced_db_annotations))
+```
+
+### Copy datasets to new files
+
+```{r apply_annotation_setup_copy_basefiles, eval = FALSE}
+annotation_datasets %>%
+  {purrr::walk2(
+    .$full_dataset,
+    .$annotation_db,
+    clamshell::sqlite_copy,
+    overwrite = TRUE
+  )}
+
+# patch files
+purrr::walk(annotation_datasets$annotation_db, patch_metaGroupId)
+```
+
+## Extract all annotated features in the full dataset as EICs
+
+```{r extract_eics}
+overwrite = FALSE
+
+# manual extraction take a while so cache the results for each dataset
+reextraction_list <- list()
+#for (i in 2) {
+for (i in 1:nrow(annotation_datasets)) {
+  
+  to_be_annotated_db_path <- annotation_datasets$annotation_db[i]
+  reduced_annotated_db_path <- annotation_datasets$reduced_db_annotations[i]
+  sample_folder <- file.path(met_dataset_path, paste0(annotation_datasets$method[i], "-set123"))
+  
+  # update rt_update_key
+  
+  eic_path <- file.path(annot_dir, paste0(annotation_datasets$method[i], ifelse(!is.na(annotation_datasets$label[i]), paste0("_", annotation_datasets$label[i]), ""), "_reextracted.Rds"))
+  
+  print(glue::glue("extracting {reduced_annotated_db_path} annotations in {to_be_annotated_db_path}"))
+  
+  if (file.exists(eic_path) && !overwrite) {
+    reextraction_list[[i]] <- readRDS(eic_path)
+  } else {
+  
+    reextracted_intensities <- clamr::reextracted_compound_intensities(
+      curated_mzrolldb = reduced_annotated_db_path,
+      full_mzrolldb = to_be_annotated_db_path,
+      sample_folder = sample_folder
+    )
+    
+    saveRDS(reextracted_intensities, eic_path)
+    reextraction_list[[i]] <- reextracted_intensities
+  }
+}
+
+annotation_datasets$reextracted_intensities <- reextraction_list
+```
+
+### Annotate Peakgroups which Strongly Agree With Bookmarks
+
+- append perfectly matched peaks (extremely high correlation and all samples measureed)
+- remove peakgroups which match okay, but need to be reextracted
+
+```{r drop_currently_matched}
+annotated_mzroll_annotations <- annotation_datasets %>%
+  dplyr::left_join(
+    peakgroup_annotation_matches %>%
+      dplyr::mutate(label = dplyr::case_when(
+        stringr::str_detect(annotation_file, "split_[0-9]+") ~ stringr::str_extract(annotation_file, "split_[0-9]+"),
+        stringr::str_detect(annotation_file, "set[0-9]+") ~ stringr::str_extract(annotation_file, "set[0-9]+")
+        )
+      ) %>%
+      tidyr::nest(annotations = -c(method, label)) %>%
+      dplyr::mutate(label = stringr::str_replace(label, "set", "split_")),
+    by = c("method", "label"))
+
+if (any(is.na(annotated_mzroll_annotations$method))) {
+  stop ("undefined method, add logic")  
+  }
+
+# drop existing annotated peakgroups since they are redundant with EICs
+annotated_mzroll_annotations %>%
+  {purrr::walk2(.$annotation_db, .$annotations, update_existing_peakgroups)}
+```
+
+### Add All Reextracted Features
+
+```{r add_reextracted_features}
+annotated_mzroll_annotations %>%
+  {purrr::walk2(
+    .$annotation_db,
+    .$reextracted_intensities,
+    add_eic_peaks
+  )}
+```
+
+## Split Set1/2 and Set3 into different files for normalization
+
+- lipids are already split so they just need to be moved
+
+```{r split}
+split_path = file.path(nfs_root, "data", "4_split")
+if (!file.exists(split_path)) {
+  dir.create(split_path)
+}
+
+split_guide <- tibble::tribble(~ label, ~ regex,
+                               "split_12", "set[12]",
+                               "split_3", "set[3]")
+
+# copy already split files
+annotated_mzroll_annotations %>%
+  dplyr::filter(!is.na(label)) %>%
+  plyr::mutate(split_out = file.path(split_path, paste0(method, "_", label, ".mzrollDB"))) %>%
+  {purrr::walk2(.$annotation_db, .$split_out, file.copy, overwrite = TRUE)}
+
+annotated_mzroll_annotations %>%
+  dplyr::filter(is.na(label)) %>%
+  dplyr::select(-label) %>%
+  tidyr::crossing(split_guide) %>%
+  dplyr::mutate(split_out = file.path(split_path, paste0(method, "_", label, ".mzrollDB"))) %>%
+  # copy overwrittable file and reduce to a subset of samples
+  # copy the reduced dataset back to googledrive
+  {list(from = .$annotation_db,
+        to = .$split_out,
+        regex = .$regex)} %>%
+  purrr::pwalk(do_copy_split, overwrite = TRUE)
+```

@@ -1,0 +1,444 @@
+---
+title: "Figure 2: Exploratory Data Analysis"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+```
+
+## Principal Component Plots
+
+### On EG8/LBD corrected results
+
+```{r pca}
+# flag samples which were filtered from metabolomics/lipidomics in specific data modalities
+# these should be dropped outright across all data types to maximize the number of
+# features we can form into a matrix with no missing values
+
+tidy_omics_coredata <- tidy_omics %>%
+  romic::filter_tomic(
+    filter_table = "features",
+    filter_type = "category",
+    filter_variable = "data_modality",
+    filter_value = c("metabolomics", "lipidomics", "proteomics")
+    )
+
+valid_samples <- tidy_omics_coredata$data %>%
+  distinct(data_modality, data_type, unique_sample_id) %>%
+  count(unique_sample_id) %>%
+  filter(n == max(n))
+  
+tidy_omics_matrix_ready <- tidy_omics_coredata %>%
+  romic::filter_tomic(
+    filter_table = "samples",
+    filter_type = "category",
+    filter_variable = "unique_sample_id",
+    filter_value = valid_samples$unique_sample_id
+    ) %>%
+  romic::remove_missing_values(value_var = "corrected_log2_abundance")
+
+samples_w_pcs <- tidy_omics_matrix_ready %>%
+  romic::add_pcs(value_var = "corrected_log2_abundance", npcs = 10) %>%
+  romic::tidy_to_triple() %>%
+  {.$samples} %>%
+  mutate(
+    age_w_ddm = ifelse(is_ddm_sample, "20 months (lifespan remaining < 21 days)", as.character(Age)),
+    age_w_ddm = factor(age_w_ddm, levels = c("8 months", "14 months", "20 months", "20 months (lifespan remaining < 21 days)"))
+    ) 
+```
+
+```{r pc_plot, fig.width = 9, fig.height = 7.5}
+female = intToUtf8(9792)
+male = intToUtf8(9794)
+
+pc_plot <- romic::plot_bivariate(
+  samples_w_pcs,
+  x_var = "PC1 ",
+  y_var = "PC2",
+  color_var = "age_w_ddm",
+  shape_var = "Sex",
+  size_var = 7
+  ) +
+  scale_color_manual("Chronological Age",
+                     values = c(
+                       "8 months" = "goldenrod1",
+                       "14 months" = "darkorange2",
+                       "20 months" = "darkred",
+                       "20 months (lifespan remaining < 21 days)" = "purple"
+                  )) +
+  scale_shape_manual("Sex", values = c("F" = female, "M" = male), guide = "none") +
+  theme_minimal() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(), text = element_text(size = 20)) +
+  guides(color=guide_legend(nrow=2, override.aes = list(size=5), title.position="top", title.hjust = 0))
+
+pc_plot
+create_and_upload_figure(
+  name = "pcplot_corrected",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2",
+  width = 9,
+  height = 7.5,
+  tmp_figure_dir = params$figures_dir,
+  extensions = ".png" # pdf doesn't work with mars/venus symbols
+)
+```
+
+```{r pc_plot_fll, fig.width = 7, fig.height = 6}
+female = intToUtf8(9792)
+male = intToUtf8(9794)
+
+pc_plot_fll <- romic::plot_bivariate(
+  samples_w_pcs,
+  x_var = "PC1 ",
+  y_var = "PC2",
+  color_var = "fraction_of_life_lived",
+  shape_var = "Sex",
+  size_var = 7
+  ) +
+  scale_color_viridis_c("Fraction of\nlife lived", option = "plasma", direction = -1) +
+  scale_shape_manual("Sex", values = c("F" = female, "M" = male), guide = "none") +
+  theme_minimal() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(), text = element_text(size = 15))
+
+pc_plot_fll
+create_and_upload_figure(
+  name = "pc_plot_fll",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 7,
+  height = 6,
+  tmp_figure_dir = params$figures_dir,
+  extensions = ".png" # pdf doesn't work with mars/venus symbols
+)
+```
+
+
+```{r pc_plot_w_batcheffects, fig.height = 8, fig.width = 10}
+samples_w_pcs_w_batcheffects <- tidy_omics_matrix_ready %>%
+  romic::add_pcs(value_var = "normalized_log2_abundance", npcs = 10) %>%
+  romic::tidy_to_triple() %>%
+  {.$samples}
+
+pc_plot_w_batcheffects <- samples_w_pcs_w_batcheffects %>%
+  # cross to generation to add gray points for the facet not shown
+  crossing(samples_w_pcs_w_batcheffects %>% distinct(shown_generation = Generation)) %>%
+  mutate(
+    age_w_null = ifelse(shown_generation != Generation, NA, as.character(Age)),
+    age_w_null = factor(age_w_null, levels = levels(samples_w_pcs_w_batcheffects$Age))
+    ) %>%
+  arrange(age_w_null) %>%
+  # cross to generation to add gray points for the facet not shown
+  romic::plot_bivariate(x_var = "PC1 ", y_var = "PC2", color_var = "age_w_null", alpha = "age_w_null", size_var = 1) +
+  scale_color_manual(
+    "Chronological Age",
+    values = c(
+      "8 months" = "goldenrod1",
+      "14 months" = "darkorange2",
+      "20 months" = "darkred"
+      ),
+      na.value = "grey80") +
+  scale_alpha_manual(values = c("8 months" = 1, "14 months" = 1, "20 months" = 1), na.value = 0.2, guide = "none") +
+  facet_wrap(~ shown_generation, scale = "free") +
+  theme_bw() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+  guides(color=guide_legend(override.aes = list(size=5)))
+
+pc_plot_w_batcheffects
+create_and_upload_figure(
+  name = "pcplot_w_batcheffects",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 10,
+  height = 8,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+```{r pc_plot_w_sets, fig.height = 8, fig.width = 8}
+experimental_batches <- feature_design_list$features_with_design %>%
+  distinct(data_type, unique_batch, set, Mouse.ID, Age) %>%
+  filter(data_type == "metabolites-pos") %>%
+  select(-data_type) %>%
+  mutate(batch = as.integer(stringr::str_extract(unique_batch, "[0-9]+$")))
+
+# look at each data modality overlaid with batches
+
+data_type_pcs <- tidy_omics_matrix_ready$data %>%
+  distinct(data_type) %>%
+  dplyr::mutate(data_type_pcs = purrr::map(
+    data_type,
+    ~ romic::filter_tomic(
+      tidy_omics_matrix_ready,
+      filter_table = "features",
+      filter_type = "category",
+      filter_variable = "data_type",
+      filter_value = .
+      ) %>%
+      romic::add_pcs(
+        value_var = "corrected_log2_abundance",
+        npcs = 10,
+        label_percent_varex = FALSE
+        ) %>%
+      romic::tidy_to_triple() %>%
+      {.$samples}
+    )) %>%
+  tidyr::unnest(data_type_pcs) %>%
+  select(-set) %>%
+  left_join(experimental_batches, by = c("Mouse.ID", "Age"))
+  
+pc_plot_by_batch_and_datamodality <- data_type_pcs %>%
+  crossing(data_type_pcs %>% distinct(shown_set = set)) %>%
+  mutate(
+    batch_w_null = ifelse(shown_set != set, NA, batch),
+    background_point = ifelse(shown_set != set, TRUE, FALSE),
+    shown_set = glue::glue("Set {shown_set}"),
+    data_type = ifelse(data_type == "tryptic-compms", "proteomics", data_type)
+    ) %>%
+  arrange(batch_w_null) %>%
+  romic::plot_bivariate(x_var = "PC1", y_var = "PC2", color_var = "batch_w_null", alpha = "background_point", size_var = 1) +
+  facet_grid(shown_set ~ data_type, scales = "free") +
+  scale_color_viridis_c("Batch within set", option = "plasma") +
+  scale_alpha_manual(values = c(`TRUE` = 0.2, `FALSE` = 1), guide = "none") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+  
+pc_plot_by_batch_and_datamodality
+create_and_upload_figure(
+  name = "pc_plot_by_batch_and_datamodality",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 8,
+  height = 8,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+
+```{r}
+tidy_measurements <- tidy_omics_matrix_ready$data %>%
+  select(groupId, data_type, data_modality, unique_sample_id, corrected_log2_abundance)
+
+# all data types present
+stopifnot(nrow(tidy_measurements %>% distinct(groupId, data_type, data_modality) %>% count(data_type, data_modality)) == 5)
+# 5 samples filtered
+stopifnot(nrow(tidy_measurements %>% distinct(unique_sample_id) %>% count(unique_sample_id)) == 325)
+
+tidy_measurements_X <- tidy_measurements %>%
+  reshape2::acast(groupId + data_modality ~ unique_sample_id, value.var = "corrected_log2_abundance")
+
+tidy_measurements_svd <- svd(tidy_measurements_X)
+```
+
+```{r scree_plot, fig.height = 4, fig.width = 4}
+screeplot <- tibble(
+  percent_varex = tidy_measurements_svd$d^2 / sum(tidy_measurements_svd$d^2)
+) %>%
+  mutate(
+    pc_number = 1:dplyr::n(),
+    cumulative_varex = cumsum(percent_varex)
+    ) %>%
+  filter(pc_number < 25) %>%
+  ggplot(aes(x = pc_number, y = percent_varex)) +
+  geom_point(size = 4, color = "deeppink1") +
+  geom_point(aes(y = cumulative_varex / 10), size = 4, color = "darkorchid1") +
+  scale_x_continuous("Principal Component") +
+  scale_y_continuous("% of Variance Explained", labels = scales::percent, sec.axis = sec_axis( trans=~.*10, name="Cumulative % of Variance Explained", labels = scales::percent)) +
+  theme_bw() +
+  theme(
+    axis.title.y = element_text(color = "deeppink1", size=13),
+    axis.title.y.right = element_text(color = "darkorchid1", size=13)
+    )
+
+screeplot
+create_and_upload_figure(
+  name = "screeplot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 4,
+  height = 4,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+````{r sample_pc_distance, fig.height = 3.5, fig.width = 6}
+# Normalize data so that we can calculate sample's Mahalanobis distance
+tidy_measurements_X_std <- scale(tidy_measurements_X %>% t()) %>% t()
+tidy_measurements_X_std_svd <- svd(tidy_measurements_X_std, nv = 10)  
+
+tidy_measurements_X_std_v <- tidy_measurements_X_std_svd$v * matrix(tidy_measurements_X_std_svd$d[1:10], ncol = 10, nrow = ncol(tidy_measurements_X_std), byrow = TRUE)
+
+# check the calculation
+# total variance x fraction variance explained by leading PCs
+varex_leading_components <- sum(tidy_measurements_X_std^2) * sum((tidy_measurements_svd$d^2 / sum(tidy_measurements_svd$d^2))[1:10])
+
+pc_distances <- tibble::tibble(
+  unique_sample_id = colnames(tidy_measurements_X),
+  pc_distance = rowSums(tidy_measurements_X_std_v^2)
+) %>%
+  left_join(samples_w_pcs %>% select(unique_sample_id, age_w_ddm, lifespan_remaining), by = "unique_sample_id") %>%
+  arrange(desc(pc_distance)) 
+
+stopifnot((sum(pc_distances$pc_distance) - varex_leading_components)/varex_leading_components < 0.01)
+
+mahalanobis_dists_plot <- ggplot(data = pc_distances, aes(x = pc_distance, fill = age_w_ddm)) +
+  geom_histogram(binwidth = 100) +
+  ggrepel::geom_label_repel(data = pc_distances %>% dplyr::filter(lifespan_remaining < 21), aes(label = lifespan_remaining), y = 1, color = "gray90") +
+  scale_x_continuous("Mahalanobis Distance based on Principal Components") +
+  scale_y_continuous("# of Samples") +
+  scale_fill_manual("Chronological Age",
+                     values = c(
+                       "8 months" = "goldenrod1",
+                       "14 months" = "darkorange2",
+                       "20 months" = "darkred",
+                       "20 months (lifespan remaining < 21 days)" = "purple"
+                  )) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  guides(fill=guide_legend(nrow=2, title.position="top", title.hjust = 0))
+
+mahalanobis_dists_plot
+create_and_upload_figure(
+  name = "mahalanobis_dists_plot",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 6,
+  height = 3.5,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Heatmaps
+
+```{r heatmaps, fig.height = 12, fig.width = 7}
+male_female_symbol_df <- tibble::tribble(
+  ~ Sex, ~ sex_char,
+  "F", intToUtf8(9792),
+  "M", intToUtf8(9794)
+)
+
+corrected_heatmap <- romic::update_tomic(
+  tidy_omics_coredata,
+  romic::get_tomic_table(tidy_omics_coredata, "samples") %>%
+    left_join(male_female_symbol_df, by = "Sex") %>%
+    mutate(Age = fct_recode(Age, "8m" = "8 months", "14m" = "14 months", "20m" = "20 months"))
+) %>%
+  romic::sort_tomic(
+    sort_table = "samples",
+    sort_type = "arrange",
+    sort_variables = c("Age", "lifespan_remaining"),
+    value_var = "corrected_log2_abundance"
+    ) %>%
+  romic::plot_heatmap(
+  value_var = "corrected_log2_abundance",
+  cluster_dim = "rows",
+  change_threshold = 3,
+  max_display_features = Inf,
+  y_label = "",
+  x_label = "Samples arranged by lifespan remaining"
+) +
+  facet_grid(data_modality ~ sex_char + Age, scales = "free", space = "free")
+
+corrected_heatmap
+create_and_upload_figure(
+  name = "corrected_heatmap",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2",
+  width = 7,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = ".png"
+)
+
+corrected_heatmap_fll <- romic::update_tomic(
+  tidy_omics_coredata,
+  romic::get_tomic_table(tidy_omics_coredata, "samples") %>%
+    left_join(male_female_symbol_df, by = "Sex")
+) %>%
+  romic::sort_tomic(
+    sort_table = "samples",
+    sort_type = "arrange",
+    sort_variables = c("fraction_of_life_lived"),
+    value_var = "corrected_log2_abundance"
+    ) %>%
+  romic::plot_heatmap(
+  value_var = "corrected_log2_abundance",
+  cluster_dim = "rows",
+  change_threshold = 3,
+  max_display_features = Inf,
+  y_label = "",
+  x_label = "Samples arranged by fraction of life lived"
+) +
+  facet_grid(data_modality ~ ., scales = "free", space = "free")
+
+corrected_heatmap_fll
+create_and_upload_figure(
+  name = "corrected_heatmap_fll",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 7,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = ".png"
+)
+
+heatmap_w_batcheffects <- tidy_omics_coredata %>%
+  romic::sort_tomic(
+  sort_table = "samples",
+  sort_type = "arrange",
+  sort_variables = "Draw_date",
+  value_var = "normalized_log2_abundance"
+  ) %>%
+  romic::plot_heatmap(
+    value_var = "normalized_log2_abundance",
+    change_threshold = 3,
+    cluster_dim = "rows",
+    max_display_features = Inf,
+    y_label = "",
+    x_label = "Samples arranged by blood draw date"
+    ) +
+  facet_grid(data_modality ~ Generation, scales = "free", space = "free")
+
+heatmap_w_batcheffects
+create_and_upload_figure(
+  name = "heatmap_w_batcheffects",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure2/Supp",
+  width = 10,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```

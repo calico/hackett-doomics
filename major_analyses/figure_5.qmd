@@ -1,0 +1,932 @@
+---
+title: "Figure 5 - The molecular architecture of longevity"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+In the figure 4 section we were able to assign age/lifespan-associated features to specific "aging archetypes". In this section we will explore the extent to which GO categories and their associated archetypes are reflecting related or independent biological processes. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+domics_signif <- load_domics("signif", domics_paths)
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+features_with_design <- load_domics("features", domics_paths)
+
+signif_all_models <- load_domics("signif_all_models", domics_paths)
+
+features <- romic::get_tomic_table(tidy_omics, "features") %>%
+  add_feature_label(feature_design_list)
+samples <- romic::get_tomic_table(tidy_omics, "samples")
+
+# script-specific setup
+# load Cached lifespan-associated features and cleaned up metadata from figure_3.Rmd
+figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
+figure_4_out <- readRDS(file = file.path(params$cache_dir, "figure_4_out.RDS"))
+
+# functions for bootstrapped regression
+library(patchwork)
+source(file.path(params$repo_path, "utils/data_prep.R"))
+source(file.path(params$repo_path, "3_interactive", "results_browser", "interactive.R"))
+
+# if FALSE then re-use bootstrapped regression results
+overwrite = FALSE
+```
+
+## Summarize GO categories on a sample-by-sample basis
+
+```{r aging_measures_sample_heatmap, fig.height = 9, fig.width = 9}
+# assign each GO category to a governing term
+# based on term, select the relevant model and coefficient to work with
+age_driver_model_definitions <- tibble::tribble(
+  ~ aging_archetype, ~ model_name, ~ relevent_term, ~ measure_list,
+  "age x lifespan", "cross-sectional lm (int-age x lifespan), no DDM", "age x lifespan", list("blood_draw_age_actual", "lifespan"),
+  "chronological age", "cross-sectional lm (int-age), no DDM", "age", list("blood_draw_age_actual"),
+  "fraction of life lived", "cross-sectional lm (fll), no DDM", "fraction of life lived", list("fraction_of_life_lived"),
+  "lifespan", "cross-sectional lm (lifespan), no DDM", "lifespan", list("lifespan"),
+  "lifespan-remaining", "cross-sectional lm (lifespan-remaining), no DDM", "lifespan remaining", list("lifespan_remaining")
+)
+
+go_top_term <- figure_4_out$term_affinity_summaries %>%
+  arrange(desc(relative_prob)) %>%
+  group_by(category_label) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(category_label, aging_archetype)
+
+go_age_measures_list_cache <- file.path(params$cache_dir, "go_age_measures_list.Rds")
+if (file.exists(go_age_measures_list_cache) && !overwrite) {
+  go_age_measures_list <- readRDS(go_age_measures_list_cache)
+} else {
+  go_catered_measures <- figure_4_out$top_pathways_for_term_affinity %>%
+    # assign a model defining each terms primary aging pattern
+    left_join(go_top_term, by = "category_label") %>%
+    # infer sample-level activities of each aging GO category
+    dplyr::mutate(
+      go_age_measure = purrr::map2(
+        diffex_members,
+        aging_archetype,
+        infer_age_measure_given_go,
+        signif_all_models = signif_all_models
+      ))
+  
+  go_fll_measures <- figure_4_out$top_pathways_for_term_affinity %>%
+    # evaluate all samples relative age based on fraction of life lived
+    dplyr::mutate(
+      go_age_measure = purrr::map(
+        diffex_members,
+        infer_age_measure_given_go,
+        an_aging_archetype = "fraction of life lived",
+        signif_all_models = signif_all_models
+      ))
+  
+  go_age_measures_list <- list(
+    go_catered_measures = go_catered_measures,
+    go_fll_measures = go_fll_measures
+  )
+  
+  saveRDS(go_age_measures_list, go_age_measures_list_cache)
+}
+
+# create a plot where each pathway's delta age estimate is based on its top archetype
+go_catered_measures_grob <- go_age_measures_list$go_catered_measures %>%
+  filter(aging_archetype %in% c("chronological age", "fraction of life lived", "age x lifespan")) %>%
+  {suppressMessages(create_aging_measures_heatmap(., samples))}
+
+go_catered_measures_grob
+create_and_upload_figure(
+  name = "go_catered_measures",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure5/Supp",
+  width = 9,
+  height = 9,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+
+# create a plot where all aging pathways delta age is calculated relative to
+# fraction of life lived
+go_fll_measures_grob <- go_age_measures_list$go_fll_measures %>%
+  {suppressMessages(create_aging_measures_heatmap(., samples))}
+
+go_fll_measures_grob
+create_and_upload_figure(
+  name = "go_fll_measures",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure5",
+  width = 9,
+  height = 9,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Examples of fitted measures
+
+```{r fitted_relative_aging}
+go_age_examples <- go_age_measures_list$go_catered_measures %>%
+  #filter(aging_archetype %in% c("age x lifespan", "chronological age", "fraction of life lived")) %>%
+  #group_by(aging_archetype) %>%
+  #sample_n(1) %>%
+  dplyr::filter(category_label %in% c("Metabolomics Knowns", "Inflammation", "IGF Signaling")) %>%
+  select(-all_members, -diffex_members) %>%
+  unnest(go_age_measure)
+
+dmeasure_subset <- go_age_examples %>%
+  group_by(aging_archetype) %>%
+  arrange(desc(abs(dmeasure))) %>%
+  slice(1:2) %>%
+  mutate(label = glue::glue("{Mouse.ID} @ {Age} : {round(dmeasure, 3)}")) %>%
+  ungroup() %>%
+  mutate(
+    category_color_hex = gplots::col2hex(category_color),
+    aging_archetype_markdown = glue::glue("**{aging_archetype}**"),
+    category_label_markdown = glue::glue("**<span style='color: {category_color_hex}'>{category_label}</span>**")
+    )
+
+dmeasure_sample_obs <- dmeasure_subset %>%
+  unnest(sample_data) %>%
+  left_join(features, by = c("data_modality", "data_type", "groupId"))
+
+dmeasure_sample_obs_labels <- dmeasure_sample_obs %>%
+  group_by(label) %>%
+  arrange(desc(abs(.resid))) %>%
+  slice(1:3)
+
+delta_age_grob <- ggplot(dmeasure_sample_obs, aes(x = estimate, y = .resid)) +
+  geom_hline(yintercept = 0, color = "gray50") +
+  geom_vline(xintercept = 0, color = "gray50") +
+  geom_point() +
+  ggrepel::geom_label_repel(data = dmeasure_sample_obs_labels, aes(label = feature_label), size = 3) +
+  facet_wrap(~ aging_archetype_markdown + category_label_markdown + label, scale = "free", dir = "v", ncol = 3) +
+  scale_x_continuous("Feature regression coefficient") +
+  scale_y_continuous("Regression residual") +
+  theme_bw() +
+  theme(strip.text.x = ggtext::element_markdown(hjust = 0))
+```
+
+```{r igf_delta_age}
+igf1_data <- features_with_design %>%
+  left_join(features, by = c("data_modality", "data_type", "groupId")) %>%
+  filter(feature_label %in% c("Cp", "Afp", "Pcsk9", "Igfbp5")) %>%
+  filter(Age == "20 months") %>%
+  mutate(age_w_ddm = ifelse(is_ddm_sample, "20 months (lifespan remaining < 21 days)", as.character(Age)))
+
+igf1_sample_labels <- igf1_data %>%
+  semi_join(
+    dmeasure_sample_obs_labels %>%
+      filter(category_label == "IGF Signaling"),
+    by = "Mouse.ID"
+  )
+
+igf_delta_age_grob <- ggplot(igf1_data, aes(x = lifespan_remaining, y = log2_fold_change, color = age_w_ddm)) +
+  geom_point() +
+  ggrepel::geom_label_repel(data = igf1_sample_labels, aes(label = Mouse.ID)) +
+  facet_wrap(~ feature_label, scale = "free_y") +
+  scale_x_continuous("Lifespan remaining (days)") +
+  scale_y_continuous(expression(log[2] ~ "fold-change at 20 months relative to 8 months")) +
+  scale_color_manual("Chronological Age",
+                     values = c(
+                       "20 months" = "darkred",
+                       "20 months (lifespan remaining < 21 days)" = "purple"
+                  )) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r pathway_delta_age_explained, fig.height = 11, fig.width = 9}
+pathway_delta_age_explained_grob <- delta_age_grob / igf_delta_age_grob & 
+  plot_layout(heights = c(1.5, 1)) &
+  plot_annotation(tag_levels = 'A')
+
+pathway_delta_age_explained_grob
+create_and_upload_figure(
+  name = "pathway_delta_age_explained",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure5/Supp",
+  width = 9,
+  height = 11,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+
+## Lifespan Correlations
+
+```{r setup_glasso_feature_matrix}
+##### read SHOCK phenotypes for context
+ 
+# TO DO - if retained then phenotypes should be exported to GCS
+mouse_phenotypes <- load_mouse_phenotypes(params$shock_token, reduced_phenotypes = FALSE)
+
+# map from mouse phenotypes to unique_sample_id
+
+gglasso_sample_data <- samples %>%
+  dplyr::filter(!is_ddm_sample)
+
+other_phenotypes <- mouse_phenotypes$age_based_phenotypes %>%
+  # stub Value as corrected_log2_abundance
+  dplyr::rename(Age = blood_draw_age_coarse, corrected_log2_abundance = Value) %>%
+  mutate(feature_label = case_when(
+    Phenotype == Phenotype.Category ~ Phenotype,
+    TRUE ~ glue::glue("{Phenotype.Category} - {Phenotype}")
+  ),
+  data_modality = "non-omics",
+  feature_aging_archetype = "non-omics"
+  ) %>%
+  # filter to relevant samples and add unique_sample_id which will be a consistent
+  # sample identifier with molecular data
+  dplyr::inner_join(gglasso_sample_data %>% select(unique_sample_id, Mouse.ID, Age), by = c("Mouse.ID", "Age")) %>%
+  tidyr::unite(feature_name, Phenotype.Category, feature_label, remove = FALSE) %>%
+  select(-Mouse.ID, -Sex, -Generation, -Age, -Phenotype.Category) %>%
+  # transform so other phenotypes are on a similar scale to molecular phenotypes
+  mutate(corrected_log2_abundance = sqrt(corrected_log2_abundance))
+```
+
+
+```{r lifespan_dfs_setup}
+# load features selected for highlighting in figure 4 and 5   
+feature_labels <- figure_4_out$top_longevity_hits_in_pathways %>%
+  distinct(data_modality, groupId, feature_label) %>%
+  mutate(select_hit_label = TRUE)
+
+lifespan_hits_features <- figure_4_out$longevity_features_to_top_pathway %>%
+  # focus on age x lifespan and lifespan interactions
+  filter(dplyr::case_when(
+    q.value < 0.1 ~ TRUE,
+    # retain the super strong lipid unknowns
+    is.na(q.value) & pvalue_bs < 0.0001 ~ TRUE,
+    TRUE ~ FALSE
+    )) %>%
+  # add other features
+  dplyr::bind_rows(other_phenotypes %>% distinct(feature_name, feature_label, data_modality, feature_aging_archetype)) %>%
+  # choose molecules to label
+  left_join(feature_labels, by = c("data_modality", "groupId", "feature_label")) %>%
+  mutate(select_hit_label = ifelse(is.na(select_hit_label), FALSE, select_hit_label)) %>%
+  # label molecules with the type of lifespan associations they have
+  mutate(
+    feature_aging_archetype = factor(feature_aging_archetype, levels = c(levels(figure_4_out$top_longevity_hits_in_pathways$feature_aging_archetype), "non-omics")),
+    # select which features to label
+    hit_label = dplyr::case_when(
+      select_hit_label ~ feature_label,
+      #lifespan < 0.01 ~ feature_label,
+      #`late age x lifespan` < 0.01 ~ feature_label,
+      #stringr::str_detect(feature_label, "^\\(\\-\\) unk") & data_modality == "lipidomics" ~ feature_label,
+      #data_modality == "non-omics" ~ feature_label,
+      TRUE ~ NA_character_
+    ),
+    category_label = forcats::fct_na_value_to_level(category_label, level = "Non-omics phenotypes"),
+    category_general_label = forcats::fct_na_value_to_level(category_general_label, level = "Non-omics phenotypes")
+  ) %>%
+  relocate(feature_name)
+
+functional_category_colors <- lifespan_hits_features %>%
+  distinct(data_modality, qvalue_min_overall, category_general_label, category_color) %>%
+  # drop metabolomics unknowns for this analysis
+  filter(category_general_label != "Metabolomics Unknowns") %>%
+  # order categories
+  mutate(data_modality = factor(data_modality, levels = c("proteomics", "metabolomics", "lipidomics", "non-omics"))) %>%
+  arrange(data_modality, qvalue_min_overall) %>%
+  group_by(category_general_label) %>%
+  slice(1) %>%
+  arrange(data_modality, qvalue_min_overall) %>%
+  mutate(
+    category_color = stringr::str_replace_na(category_color, "gray50"),
+    category_color_hex = gplots::col2hex(category_color)
+  )
+    
+lifespan_hits_features <- lifespan_hits_features %>%
+  semi_join(functional_category_colors, by = "category_general_label")
+
+lifespan_hits_data <- tidy_omics$data %>%
+  filter(!is_ddm_sample) %>%
+  semi_join(lifespan_hits_features, by = c("data_modality", "groupId")) %>%
+  select(data_modality, groupId, feature_name, cluster, Sex, unique_sample_id, corrected_log2_abundance) %>%
+  group_by(data_modality, groupId, Sex) %>%
+  mutate(corrected_log2_abundance = corrected_log2_abundance - mean(corrected_log2_abundance)) %>%
+  ungroup() %>%
+  # add other phenotype
+  dplyr::bind_rows(other_phenotypes)
+
+lifespan_hit_matrix <- lifespan_hits_data %>%
+  reshape2::acast(feature_name ~ unique_sample_id, value.var = "corrected_log2_abundance")
+
+# find identical features
+colinear_lifespan_features <- cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(feature_2 = row.names(.)) %>%
+  as_tibble() %>%
+  gather(feature_1, corr, -feature_2) %>%
+  filter(feature_2 != feature_1) %>%
+  filter(abs(corr) > 0.99) %>%
+  # retain just one entry
+  # i guess you can filter by alphabetical order - useful but a little scary
+  filter(feature_1 < feature_2)
+  
+if (nrow(colinear_lifespan_features) > 0) {
+  stop("Nearly perfectly correlated features were found, these should be corrected in analysis_differential_abundances.Rmd")
+}
+```
+
+### Heatmap of Lifespan Hit Correlations
+
+```{r correlation_heatmap, fig.height = 10, fig.width = 10}
+# align features to matrix for marking up the correlation matrix heatmap
+
+lifespan_hits_features_aligned_to_matrix <- lifespan_hits_features %>%
+  dplyr::mutate(feature_name = factor(
+    feature_name,
+    levels = rownames(lifespan_hit_matrix))
+    ) %>%
+  left_join(data_modality_colorscheme, by = "data_modality")
+
+my_palette <- colorRampPalette(c("steelblue1", "black", "yellow"))(n = 1000)
+
+heatmap_local_path <- file.path(params$figures_dir, "correlation_heatmap.pdf")
+pdf(heatmap_local_path, height = 10, width = 10)
+
+# saveRDS(cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs"), "/tmp/lifespan_correlations.Rds")
+
+cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs") %>%
+  gplots::heatmap.2(
+    trace = "none",
+    symm = TRUE,
+    RowSideColors = lifespan_hits_features_aligned_to_matrix$color,
+    dendrogram = "row",
+    col = my_palette,
+    key.xlab = "correlation",
+    cexCol = 0.01
+    )
+
+legend(
+  "topright",
+  title = "Data Modality",
+  legend=data_modality_colorscheme$data_modality, 
+  fill=data_modality_colorscheme$color,
+  cex=0.8,
+  box.lty=0
+  )
+dev.off()
+
+calibase::upload_to_drive(
+  heatmap_local_path,
+  drive_path = "Figures/Figure5/Supp",
+  drive_root = params$manuscript_drive_root,
+  delete_existing_versions = TRUE
+)
+```
+
+```{r aging_corr_structure_summary}
+corr_degree_dist <- svd(cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs"))$d
+corr_degree_fraction_varex <- corr_degree_dist^2 / sum(corr_degree_dist^2)
+# the top 10 PCs contain 83% of the matrix's variance
+sum(corr_degree_fraction_varex[1:10])
+```
+
+```{r imputation_enforcing_psd}
+# the minimum eigenvalue of the unimputed covariance is -2.2
+# the matrix is not positive semi-definite
+min(eigen(cov(t(lifespan_hit_matrix), use = "pairwise.complete.obs"))$values)
+
+# remotes::install_bioc("impute")
+lifespan_hit_matrix_imp <- impute::impute.knn(lifespan_hit_matrix, rowmax = 0.6)$data
+lifespan_hit_matrix_cov <- cov(t(lifespan_hit_matrix_imp))
+
+# the minimum eigenvalue of the imputed covariance matrix is ~0
+# the matrix is positive semi-definite and we can apply gglasso to it
+min(eigen(lifespan_hit_matrix_cov)$values)
+```
+
+## Fit Graphical LASSO
+
+```{r fit_glasso}
+# cache hyperparameter sweep
+glasso_fits_path <- file.path(params$cache_dir, "glasso_fits.RDS")
+if (file.exists(glasso_fits_path) && !overwrite) {
+  glasso_fits <- readRDS(glasso_fits_path)
+} else {
+  glasso_fits <- qgraph::EBICglasso(
+    S = lifespan_hit_matrix_cov, # covariance matrix -> gets turned into corr within qgraph
+    n = ncol(lifespan_hit_matrix),
+    penalize.diagonal = FALSE,
+    gamma = 0, # set gamma at zero; ebic can be modified to other measures of gamma afterwards
+    nlambda = 100,
+    lambda.min.ratio = 0.06,
+    checkPD = FALSE, # matrix is PSD but not PD and thats okay
+    returnAllResults = TRUE,
+    threshold = FALSE # threshold trivial precisions for calculating d.o.f. in BIC
+    )
+  
+  saveRDS(glasso_fits, file = glasso_fits_path)
+}
+
+bic_to_ebic <- function(bic, gamma, invSigma) {
+  # rescale BIC based on gamma
+  # this follows qgraph:::EBIC but calculates EBIC = f(BIC, gamma)
+  # to compare BIC curves as a function of gamma
+  
+  E <- sum(invSigma[lower.tri(invSigma, diag = FALSE)] != 0)
+  p <- nrow(invSigma)
+  
+  ebic <- bic + 4 * E * gamma * log(p)
+  return(ebic)
+}
+
+lambdas <- tibble(
+  lambda = glasso_fits$lambda
+) %>%
+  mutate(
+    lambda_index = seq(n()),
+    bic = glasso_fits$ebic,
+    wi = purrr::map(lambda_index, ~ glasso_fits$results$wi[,,.x]),
+    ebic_g_0.5 = purrr::map2_dbl(bic, wi, ~ bic_to_ebic(bic = .x, gamma = 0.5, invSigma = .y))
+    ) %>%
+  # look at ratio of ebic(lambda) to the minimum value
+  # this quantity has 
+  mutate(relative_bic = bic/min(bic))
+
+feature_lookup <- tibble(
+  feature_name = rownames(lifespan_hit_matrix_cov)  
+) %>%
+  mutate(feature_index = seq(n()))
+
+S_df <- lifespan_hit_matrix_cov %>%
+  cov2cor() %>%
+  reshape2::melt() %>%
+  as_tibble()
+colnames(S_df) <- c("feature_1", "feature_2", "r_observed")
+
+# convert tensor (feature1, feature2, lambda) to tall df
+covariance_reconstruction_error <- reshape2::melt(glasso_fits$results$w) %>%
+  rename(feature_index_1 = Var1, feature_index_2 = Var2, lambda_index = Var3, r_fit = value) %>%
+  as_tibble() %>%
+  left_join(feature_lookup %>% rename(feature_index_1 = feature_index, feature_1 = feature_name), by = "feature_index_1") %>%
+  left_join(feature_lookup %>% rename(feature_index_2 = feature_index, feature_2 = feature_name), by = "feature_index_2") %>%
+  left_join(lambdas, by = "lambda_index") %>%
+  # add empirical correlations
+  left_join(S_df, by = c("feature_1", "feature_2")) %>%
+  # filter to upper diagonal
+  filter(feature_index_1 < feature_index_2) %>%
+  # summarize by lambda
+  dplyr::group_by(lambda, lambda_index) %>%
+  dplyr::summarise(
+    residual_corr_rmse = mean(sqrt((r_observed - r_fit)^2)),
+    n_nonszero = sum(r_fit != 0),
+    .groups = "drop"
+  )
+
+optimal_lambda <- lambdas$lambda[which.min(lambdas$bic)]
+
+glasso_lambda_selection_grob <- lambdas %>%
+  left_join(covariance_reconstruction_error, by = c("lambda_index", "lambda")) %>%
+  ggplot(aes(x = lambda)) +
+  geom_path(aes(y = bic / 3e6), linewidth = 2, color = "deeppink1") +
+  #geom_path(aes(y = ebic_g_0.5 / 5e6), size = 4, color = "deeppink3") +
+  geom_path(aes(y = residual_corr_rmse), linewidth = 2, color = "darkorchid1") +
+  geom_vline(xintercept = optimal_lambda, color = "deeppink1", linetype = 2, linewidth = 2) +
+  scale_x_log10(expression(lambda), breaks = round(10^seq(-2, 0, by = 0.5), 3)) +
+  scale_y_continuous("BIC (/3e6)", sec.axis = sec_axis( trans=~., name="RMSE residual covariance")) +
+  theme_bw() +
+  theme(
+    axis.title.y = element_text(color = "deeppink1", size=13),
+    axis.title.y.right = element_text(color = "darkorchid1", size=13)
+    )
+
+glasso_lambda_selection_grob
+create_and_upload_figure(
+  name = "glasso_lambda_selection_grob",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure5/Supp",
+  width = 5,
+  height = 5,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+
+# save the desired partial correlation matrix
+optimal_glasso_fit <- glasso_fits$optnet
+```
+
+```{r filter_to_relevant_partial_corrs}
+# convert from precision to partial correlations
+# https://stats.stackexchange.com/questions/140080/why-does-inversion-of-a-covariance-matrix-yield-partial-correlations-between-ran
+# qgraph::wi2net
+
+glasso_partial_corr <- optimal_glasso_fit %>%
+  as.data.frame() %>%
+  mutate(feature_1 = rownames(.)) %>%
+  gather(feature_2, partial_corr, -feature_1) %>%
+  filter(abs(partial_corr) > 0.03)
+  
+glasso_partial_corr %>%
+  count(feature_1) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1)
+
+# edges are duplicated in the symmetric matrix
+n_node_besties <- 15
+
+top_partial_corrs <- dplyr::bind_rows(
+    # combine the strongest associations for each hit w/
+    glasso_partial_corr %>%
+      group_by(feature_1) %>%
+      arrange(desc(abs(partial_corr))) %>%
+      slice(1:min(n(), n_node_besties)) %>%
+      ungroup(),
+    # make sure all of the strongest associations overall are present
+    glasso_partial_corr %>%
+      filter(abs(partial_corr) > 0.1)
+  ) %>%
+  group_by(feature_2, feature_1) %>%
+  slice(1) %>%
+  ungroup()
+  
+top_partial_corrs <- dplyr::bind_rows(
+  top_partial_corrs %>%
+    filter(feature_2 < feature_1),
+  # drop redundant reciprocal edges
+  top_partial_corrs %>%
+    filter(feature_1 < feature_2) %>%
+    anti_join(top_partial_corrs %>% filter(feature_2 < feature_1), by = c("feature_1" = "feature_2", "feature_2" = "feature_1"))
+)
+
+top_partial_corrs %>%
+  arrange(desc(partial_corr)) %>%
+  slice(1:10) %>%
+  knitr::kable(caption = "Table of top partial correlations") %>%
+  kableExtra::kable_styling()
+
+```
+
+## Visualize Partial Correlation Graph
+
+```{r partial_corr_graph, fig.height = 14, fig.width = 14}
+corr_graph <- igraph::graph_from_data_frame(
+  top_partial_corrs %>% mutate(weight = abs(partial_corr)*100),
+  vertices = lifespan_hits_features,
+  directed = FALSE
+)
+
+# drop non-molecular phenotypes which are too disconnected from molecular phenotype
+
+adjacency_matrix <- igraph::as_adjacency_matrix(corr_graph)
+# create a matrix of # of paths of length N
+con_matrix <- adjacency_matrix #%*% adjacency_matrix #%*% adjacency_matrix
+# filter so rows are molecular features and columns are other phenotypes
+other_measurement_indices <- rownames(adjacency_matrix) %in% lifespan_hits_features$feature_name[lifespan_hits_features$data_modality == "non-omics"]
+molecular_measurement_indices <- rownames(adjacency_matrix) %in% lifespan_hits_features$feature_name[lifespan_hits_features$data_modality != "non-omics"]
+
+disconnected_other_measurements <- names(which(apply(adjacency_matrix[molecular_measurement_indices, other_measurement_indices], 2, sum) == 0))
+#
+
+pruned_corr_graph <- igraph::delete.vertices(corr_graph, disconnected_other_measurements)
+
+# filter disconnected subgraphs
+
+graph_clusters <- igraph::clusters(pruned_corr_graph)
+isolated_features <- names(graph_clusters$membership)[graph_clusters$membership != which.max(graph_clusters$csize)]
+
+pruned_corr_graph <- igraph::delete.vertices(pruned_corr_graph, isolated_features)
+
+# create a network layout and append node coordinates to node attributes
+set.seed(2345)
+#graph_layout <- igraph::layout_with_kk(pruned_corr_graph, maxiter = 10000)
+graph_layout <- igraph::layout_with_fr(pruned_corr_graph, niter = 10000)
+colnames(graph_layout) <- c("x", "y")
+rownames(graph_layout) <- igraph::V(pruned_corr_graph)$name
+graph_layout <- graph_layout %>%
+  as.data.frame() %>%
+  mutate(feature_name = rownames(.))
+
+vertices_w_layout <- lifespan_hits_features %>%
+  inner_join(graph_layout, by = "feature_name")
+    
+# visualize the graph structure and themes
+lifespan_graph <- ggraph::ggraph(pruned_corr_graph, layout = "manual", x = graph_layout[,1], y = graph_layout[,2]) +
+  ggraph::geom_edge_link(aes(alpha = abs(partial_corr * 0.7)), edge_color = "gray60", width = 0.3) + #, aes(edge_color = partial_corr)) + #aes(edge_alpha = corr*0.25)) +
+  scale_color_manual(
+    "Category",
+    values = functional_category_colors$category_color,
+    breaks = functional_category_colors$category_general_label,
+    labels = functional_category_colors$category_general_label
+    ) +
+  ggraph::scale_edge_alpha_identity(expression("|" ~ rho ~ "|"), breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_manual(
+    "Category",
+    values = functional_category_colors$category_color,
+    breaks = functional_category_colors$category_general_label,
+    labels = functional_category_colors$category_general_label,
+    guide = "none"
+    ) +
+  scale_shape_manual("Molecular Aging Mode", values = c(
+    "lifespan" = 15,
+    "chronological age" = 16,
+    "fraction of life lived" = 17,
+    "age x lifespan" = 13,
+    "lifespan-remaining" = 18,
+    "non-omics" = 8), 
+    breaks = levels(lifespan_hits_features$feature_aging_archetype)
+    ) +
+  theme_void() +
+  theme(legend.position = "bottom") +
+  guides(
+    shape = guide_legend(override.aes = list(size=5), ncol = 1),
+    color = guide_legend(override.aes = list(size=5), ncol = 2),
+    edge_alpha = guide_legend(override.aes = list(size=5), ncol = 1)
+    )
+  
+clean_lifespan_graph_unlabelled <- lifespan_graph + 
+  ggraph::geom_node_point(
+    data = vertices_w_layout,
+    aes(colour = category_general_label, shape = feature_aging_archetype),
+    size = 2
+  )
+
+clean_lifespan_graph_unlabelled
+create_and_upload_figure(
+  name = "clean_lifespan_graph_unlabelled",
+  drive_path = "Figures/Figure5/Extras",
+  update_figures = params$update_figures,
+  width = 12,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)   
+  
+clean_lifespan_graph <- clean_lifespan_graph_unlabelled +
+  # light label text
+  ggrepel::geom_label_repel(
+    data = vertices_w_layout %>%
+      filter(
+        !is.na(hit_label),
+        category_general_label %in% light_label_categories
+        ),
+    aes(label = hit_label, fill = category_general_label, x = x, y = y), label.padding = unit(0.2, "lines"), alpha = 0.9, size = 2, fontface = "bold", color = "white") +
+  # dark label text
+  ggrepel::geom_label_repel(
+    data = vertices_w_layout %>% filter(
+      !is.na(hit_label),
+      !(category_general_label %in% light_label_categories)
+      ),
+    aes(label = hit_label, fill = category_general_label, x = x, y = y), label.padding = unit(0.2, "lines"), alpha = 0.9, size = 2, fontface = "bold")
+
+clean_lifespan_graph
+create_and_upload_figure(
+  name = "lifespan_graph",
+  drive_path = "Figures/Figure5",
+  update_figures = params$update_figures,
+  width = 14,
+  height = 14,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)    
+```
+
+```{r busy_glasso_graph, fig.height = 40, fig.width = 40}
+busy_lifespan_graph <- clean_lifespan_graph_unlabelled +
+  # light label text
+  ggrepel::geom_label_repel(
+    data = vertices_w_layout %>%
+      filter(
+        category_general_label %in% light_label_categories
+        ),
+    aes(label = feature_label, fill = category_general_label, x = x, y = y), label.padding = unit(0.2, "lines"), alpha = 0.9, size = 4, fontface = "bold", color = "white") +
+  # dark label text
+  ggrepel::geom_label_repel(
+    data = vertices_w_layout %>% filter(
+      !(category_general_label %in% light_label_categories)
+      ),
+    aes(label = feature_label, fill = category_general_label, x = x, y = y), label.padding = unit(0.1, "lines"), alpha = 0.6, size = 4, fontface = "bold")
+
+busy_lifespan_graph
+create_and_upload_figure(
+  name = "lifespan_graph_busy",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure5/Supp",
+  width = 40,
+  height = 40,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+) 
+```
+
+## Compare distance between processes
+
+```{r category_similarity}
+full_pcor_network <- igraph::graph_from_data_frame(
+  glasso_partial_corr,
+  directed = FALSE
+)
+
+all_distances <- igraph::distances(full_pcor_network, mode = "all", weights = 1/abs(igraph::E(full_pcor_network)$partial_corr)) %>% # minimize weighted path
+  as.data.frame() %>%
+  mutate(feature_2 = rownames(.)) %>%
+  tidyr::gather(feature_1, distance, -feature_2) %>%
+  tibble::as_tibble() %>%
+  filter(feature_1 != feature_2)
+
+all_feature_correlations <- cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(feature_2 = rownames(.)) %>%
+  tidyr::gather(feature_1, corr, -feature_2) %>%
+  tibble::as_tibble() %>%
+  filter(feature_1 != feature_2)
+  
+feature_feature_similarity <- all_distances %>%
+  left_join(all_feature_correlations, by = c("feature_1", "feature_2"))
+
+# define categories members
+category_membership <- figure_4_out$top_pathways_for_term_affinity %>%
+  select(-all_members) %>%
+  unnest(diffex_members) %>%
+  distinct(category_label, data_type, groupId) %>%
+  left_join(romic::get_tomic_table(tidy_omics, "features") %>% distinct(data_type, groupId, feature_name), by = c("groupId", "data_type")) %>%
+  select(category_label, feature_name)
+
+# create "Other" categories for each data modality
+
+within_group_distances <- calculate_category_homogeneity(
+  category_membership %>%
+    rename(category = category_label) %>% 
+    mutate(null_i = -1),
+  feature_feature_similarity = feature_feature_similarity
+) %>%
+  select(category_label = category, median_distance:median_abs_corr) %>%
+  # add general catgegory and colors
+  left_join(
+    figure_4_out$top_pathways_for_term_affinity %>% select(category_label, category_general_label, category_color),
+    by = "category_label"
+  ) %>%
+  # add size of category
+  left_join(
+    category_membership %>% count(category_label, name = "N"),
+    by = "category_label"
+  ) %>%
+  # define groups which are moderately correlated among members
+  mutate(is_coherent = ifelse(median_abs_corr > 0.2, TRUE, FALSE)) %>%
+  filter(N >= 10)
+  
+# create summaries of within category and cross category distances between pairs of functional categories
+# cache cross-category distances
+cross_group_distances_path <- file.path(params$cache_dir, "cross_group_distances.RDS")
+if (file.exists(cross_group_distances_path) && !overwrite) {
+  cross_group_distances <- readRDS(cross_group_distances_path)
+} else {
+  set.seed(1234)
+  within_group_distances_w_members <- category_membership %>%
+    nest(category_data = -category_label) %>%
+    inner_join(within_group_distances %>% select(category_label, is_coherent), by = "category_label")
+  
+  cross_group_distances <- tidyr::crossing(
+    within_group_distances_w_members %>% select(category_label_1 = category_label, category_data_1 = category_data, category_1_coherent = is_coherent),
+    within_group_distances_w_members %>% select(category_label_2 = category_label, category_data_2 = category_data, category_2_coherent = is_coherent),
+  ) %>%
+    filter(
+      as.character(category_label_1) < as.character(category_label_2),
+      category_1_coherent | category_2_coherent
+      ) %>%
+    # calculate mean shortest paths between members of different functional categories
+    mutate(cross_group_dist = purrr::map2(
+      category_data_1,
+      category_data_2,
+      calculate_cross_group_distance,
+      feature_feature_similarity = feature_feature_similarity,
+      n_permutations = 1000
+    )) %>%
+    select(category_label_1, category_label_2, cross_group_dist) %>%
+    unnest(cross_group_dist)
+  
+  saveRDS(cross_group_distances, file = cross_group_distances_path)
+}
+
+distinct_group_pairs <- cross_group_distances %>%
+  group_by(measure) %>%
+  mutate(qvalue = p.adjust(coherence_null_quantile, method = "BH"))
+```
+
+```{r category_similarity_plot, fig.height = 10, fig.width = 10}
+set.seed(1234)
+
+category_similarity_graph <- distinct_group_pairs %>%
+  filter(
+    qvalue > 0.025,
+    measure != "mean_abs_corr"
+    ) %>%
+  igraph::graph_from_data_frame(
+    directed = FALSE,
+    vertices = within_group_distances
+    )
+
+graph_layout <- igraph::layout_with_graphopt(
+  category_similarity_graph,
+  spring.length = 0.5,
+  charge = 0.25,
+  niter = 100000
+  )
+
+graph_layout <- igraph::layout_with_kk(
+  category_similarity_graph
+  )
+colnames(graph_layout) <- c("x", "y")
+rownames(graph_layout) <- igraph::V(category_similarity_graph)$name
+graph_layout <- graph_layout %>%
+  as.data.frame() %>%
+  mutate(category_label = rownames(.))
+
+graph_data_w_layout <- within_group_distances %>%
+  inner_join(graph_layout, by = "category_label") %>%
+  mutate(
+    fontface = ifelse(is_coherent, "bold", "italic"),
+    fontsize = ifelse(is_coherent, 4, 3)
+    )
+
+cross_category_distinctness_plot <- ggraph::ggraph(
+  category_similarity_graph,
+  layout = "manual",
+  x = graph_layout$x,
+  y = graph_layout$y
+  ) +
+  ggraph::geom_edge_parallel(aes(edge_color = measure), edge_width = 0.5) +
+  ggraph::geom_node_point() +
+  ggraph::geom_node_label(
+    data = graph_data_w_layout %>%
+      filter(
+        category_general_label %in% light_label_categories
+        ),
+    aes(label = category_label, fill = category_color, x = x, y = y,  size = fontsize, fontface = fontface),
+    label.padding = unit(0.2, "lines"), alpha = 1, color = "white") +
+  # dark label text
+  ggraph::geom_node_label(
+    data = graph_data_w_layout %>% filter(
+      !(category_general_label %in% light_label_categories)
+      ),
+    aes(label = category_label, fill = category_color, x = x, y = y,  size = fontsize, fontface = fontface),
+    label.padding = unit(0.2, "lines"), alpha = 1) +
+  ggraph::scale_edge_color_manual(
+    labels = c(
+      "median_distance" = expression("graph distance, between category" %~~% "within category"),
+      "median_abs_corr" = expression("median absolute correlation, between category" %~~% "within group"),
+      "mean_abs_corr" = expression("mean absolute correlation, between category" %~~% "within group")
+    ),
+    values = wesanderson::wes_palette("GrandBudapest2")
+  ) +
+  #ggraph::scale_edge_alpha_identity() +
+  scale_fill_identity() +
+  scale_size_identity() +
+  theme_void() +
+  theme(legend.position = "bottom") +
+  guides(
+    edge_color = guide_legend(ncol = 1)
+    ) +
+  expand_limits(x = c(min(graph_layout$x) - 0.2, max(graph_layout$x) + 0.2))
+  
+cross_category_distinctness_plot
+create_and_upload_figure(
+  name = "cross_category_distinctness_plot",
+  drive_path = "Figures/Figure5/Supp",
+  update_figures = params$update_figures,
+  width = 10,
+  height = 10,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Export Results
+
+```{r export}
+figure_5_out <- list()
+
+figure_5_out$distinct_group_pairs <- distinct_group_pairs
+figure_5_out$top_partial_corrs <- top_partial_corrs
+figure_5_out$lifespan_hits_features <- lifespan_hits_features
+figure_5_out$lifespan_hits_data <- lifespan_hits_data
+
+saveRDS(figure_5_out, file = file.path(params$cache_dir, "figure_5_out.RDS"))
+```

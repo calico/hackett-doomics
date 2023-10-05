@@ -1,0 +1,548 @@
+---
+title: "Figure 6 - Mechanisms"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r functions_and_utils}
+suppressPackageStartupMessages(library(tidyverse))
+
+suppressed_theme <- theme(
+  legend.position = "none",
+  strip.background = element_blank(),
+  strip.text.x = element_blank(),
+  plot.title = ggtext::element_markdown(hjust = 0.5, size = 15),
+  plot.background = element_rect(colour = "gray50", fill=NA, linewidth=0.5)
+  )
+```
+
+```{r env_setup}
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+features_with_design <- load_domics("features", domics_paths) %>%
+  filter(!is_ddm_sample, data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
+
+tidy_omics <- load_domics("tomic", domics_paths) %>%
+  romic::filter_tomic("category", "features", c("proteomics", "metabolomics", "lipidomics"), "data_modality")
+
+# pull out and augment features and samples
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+features <- romic::get_tomic_table(tidy_omics, "features") %>%
+  add_feature_label(feature_design_list)
+samples <- romic::get_tomic_table(tidy_omics, "samples")
+
+domics_signif <- load_domics("signif", domics_paths) %>%
+  semi_join(features, by = "feature_name")
+
+# load Cached lifespan-associated features and cleaned up metadata from figure_3.Rmd
+figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
+figure_4_out <- readRDS(file = file.path(params$cache_dir, "figure_4_out.RDS"))
+figure_5_out <- readRDS(file = file.path(params$cache_dir, "figure_5_out.RDS"))
+
+# duplicate partials so they are present as A-B and B-A
+top_partial_corrs <- bind_rows(
+  figure_5_out$top_partial_corrs,
+  figure_5_out$top_partial_corrs %>%
+    rename(feature_1 = feature_2, feature_2 = feature_1)
+)
+
+# pull out aging features from figure 5 and "other phenotypes"
+# which can be used to add context to some of the summaries in this section
+# the molecular summaries here are a subset of the features and fields in the
+# "features" adnd "feature_design_list" tables above aside from "other phenotypes"
+# which are not present there
+lifespan_hits_features <- figure_5_out$lifespan_hits_features
+lifespan_hits_features_with_design <- figure_5_out$lifespan_hits_data %>%
+  select(-Phenotype, -Sex, -cluster) %>%
+  left_join(samples, by = "unique_sample_id") %>%
+  left_join(features %>% select(-feature_label, -feature_name), by = c("data_modality", "groupId")) %>%
+  mutate(feature_name = ifelse(is.na(feature_name), feature_label, feature_name))
+
+# other packages
+library(patchwork)
+
+# load the shiny app's feature-level plotting functions
+source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+```
+
+## Group Pathways
+
+```{r}
+metabolomics_knowns <- figure_4_out$longevity_features_to_top_pathway  %>%
+  filter(category_general_label == "Metabolomics Knowns")
+
+lipidomics_features <- figure_4_out$longevity_features_to_top_pathway %>%
+  filter(data_modality == "lipidomics") %>%
+  mutate(
+    # include unknowns which were phytosterol sulfates
+    category_label = case_when(
+      stringr::str_detect(feature_name, "unk") ~ "Phytosterol sulfates",
+      TRUE ~ category_label
+  )) %>%
+  filter(category_label != "Other Lipidomics")
+  
+proteomics_features <- bind_rows(
+  figure_4_out$longevity_features_to_top_pathway %>%
+    filter(
+      data_modality == "proteomics",
+      category_general_label != "Other Proteomics"
+      ),
+  figure_4_out$longevity_features_to_top_pathway %>%
+    filter(
+      data_modality == "proteomics",
+      category_general_label == "Other Proteomics"
+      ) %>%
+    arrange(pvalue_bs) %>%
+    slice(1:20) %>%
+    mutate(
+      category_label = "Other Proteomics [top 20]",
+      category_general_label = "Other Proteomics [top 20]"
+      )
+)
+```
+
+## Manual Curation of Proteins
+
+```{r}
+calibase::configure_google_access()
+
+gsheet_id <- googlesheets4::as_sheets_id("1KeQ69iG0tTM58OYGQHgrN70CJ3i-FP9duqOnWpw4x38")
+
+#proteomics_features %>%
+#  select(feature_name, feature_label, go_aging_archetype, category_label, all_category_label, category_general_label, all_category_general_label, feature_aging_archetype, change_w_age, q.value) %>%
+#  googlesheets4::write_sheet(
+#  gsheet_id,
+#  "raw_associations"
+#)
+
+proteomics_features_annotated <- googlesheets4::read_sheet(
+  gsheet_id,
+  sheet = "associations_v2"
+)
+```
+
+## Changes in Metabolism
+
+### Central Carbon Metabolism and Focus Pathways
+
+```{r metabolism}
+# nicotinic acid -> decreases
+# FA -> decreases
+metabolite_categories <- list(
+  AAs = c("(-) L-Alanine", "(-) L-Proline", "(-) L-Threonine", "(-) L-Tryptophan", "(-) L-Histidine", "(-) L-Glutamic acid", "(+) Glycine", "(-) L-Leucine", "(-) L-Lysine", "(+) L-Phenylalanine", "(-) L-Valine", "(+) L-Glutamic acid", "(+) L-Methionine", "(+) L-Proline", "(-) L-Methionine", "(+) L-Aspartic acid", "(-) L-Isoleucine"),
+  `AA related` = c("(+) 1-Methylhistidine", "(+) L-prolylglycine", "(+) Homocitrulline", "(+) Pipecolic acid", "(-) Pipecolic acid", "(+) N-Formyl-L-methionine", "(+) N-Acetylglutamine", "(-) O-Acetylserine", "(+) Anserine", "(+) L-Carnitine", "(+) L-Acetylcarnitine", "(+) Acetylcysteine", "(+) Norvaline", "(+) Citrulline", "(+) 4-Hydroxyproline", "(+) N-Acetylvaline", "(-) N-Acetyl-L-methionine", "(+) N-Acetylglutamic acid", "(-) N-Acetylglutamic acid (2)", "(+) Methionine sulfoxide", "(+) L-prolinamide", "(+) Carnosine", "(-) N-Acetyl-L-aspartic acid", "(-) N-Acetyl-L-alanine", "(-) 3-Hydroxymethylglutaric acid"),
+  Glycolysis = c("(-) Pyruvic acid", "(-) L-Glyceric acid", "(+) Glycerol 3-phosphate", "(-) 3-Phosphoglyceric acid", "(+) D-Glucose"),
+  TCA = c("(-) Fumaric acid (3)", "(-) Succinic acid", "(-) L-Malic acid", "(-) Fumaric acid (2)", "(-) Oxoglutaric acid", "(-) Fumaric acid (1)", "(+) Citric acid"),
+  NAD = c("(+) Nicotinic acid", "(+) Nicotinamide N-oxide"),
+  `Bile\nsalts` = c("(-) Taurocholic acid (1)", "(-) Taurocholic acid (2)", "(+) 3a,7a,12b-Trihydroxy-5b-cholanoic acid", "(-) N-Acetyltaurine"),
+  `Choline\nrelated` = c("(+) LysoPC(P-16:0)", "(+) Glycerophosphocholine", "(+) Phosphorylcholine (2)", "(+) Phosphorylcholine (3)", "(+) Phosphorylcholine")
+) %>%
+  {purrr::map2(names(.), unname(.), ~ tibble(metabolite_category = .x, feature_name = .y))} %>%
+  dplyr::bind_rows()
+
+# increase or decrease w/ age
+# aging archetype
+# functional category
+# significant partial correlation?
+
+aging_core_metabolites <- metabolite_categories %>%
+  left_join(metabolomics_knowns, by = "feature_name")
+
+aging_core_metabolites_grob <- visualize_feature_subsets(
+  aging_core_metabolites,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "metabolite_category"
+  )
+```
+
+### All Aging Metabolite Knowns
+
+```{r metabolites_extended}
+all_known_aging_metabolites <- bind_rows(
+  metabolite_categories,
+  metabolomics_knowns %>%
+    anti_join(metabolite_categories, by = "feature_name") %>%
+    select(feature_name) %>%
+    mutate(metabolite_category = "Other identified metabolites")
+)
+    
+aging_known_metabolites <- all_known_aging_metabolites %>%
+  left_join(metabolomics_knowns, by = "feature_name")
+
+aging_known_metabolites_grob <- visualize_feature_subsets(
+  aging_known_metabolites,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "metabolite_category"
+  )
+```
+
+### Metabolites with Enzymes
+
+```{r metabolites_w_enzymes}
+aging_metabolites_w_enzymes <- dplyr::bind_rows(
+  metabolite_categories %>%
+    left_join(metabolomics_knowns, by = "feature_name"),
+  proteomics_features_annotated %>%
+    select(feature_name, manual_category) %>%
+    filter(case_when(
+      manual_category == "Enzymes" ~ TRUE,
+      .default = FALSE
+      )) %>%
+    rename(metabolite_category = manual_category) %>%
+    left_join(proteomics_features, by = "feature_name")
+)
+
+aging_core_metabolites_w_enzymes_grob <- visualize_feature_subsets(
+  aging_metabolites_w_enzymes,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "metabolite_category"
+  ) + theme(legend.position = "none")
+```
+
+### Combine Metabolite Heatmaps
+
+```{r aging_metabolomics_supp_grob, fig.height = 26, fig.width = 16}
+aging_metabolomics_supp_grob <- aging_known_metabolites_grob +
+  aging_core_metabolites_w_enzymes_grob +
+  guide_area() +
+  plot_layout(
+    guides = "collect",
+    heights = c(1.2, 1),
+    widths = c(1.8, 0.4),
+    design = c(
+      "
+      AA
+      BC
+      "
+    )) +
+  plot_annotation(tag_levels = 'A')
+
+aging_metabolomics_supp_grob
+create_and_upload_figure(
+  name = "aging_metabolomics_supp",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 16,
+  height = 26,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Metabolite Highlights
+
+### Taurocholic Acid
+
+```{r taurine, fig.width = 10, fig.height = 7}
+taurine_feature_names <- filter(all_known_aging_metabolites, stringr::str_detect(feature_name, "[tT]auroch"))$feature_name
+
+taurocholic_acid_grob <- plot_fraction_of_life_lived(features_with_design, domics_signif, feature_names = taurine_feature_names)$plots$fraction_of_life_lived + labs(title = glue::glue("Fraction of life lived: **taurine + cholic acid**")) + theme(plot.title = ggtext::element_markdown(hjust = 0.5, size = 15),
+  plot.background = element_rect(colour = "gray50", fill=NA, linewidth=0.5))
+
+taurocholic_acid_grob
+create_and_upload_figure(
+  name = "taurocholic_acid",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 10,
+  height = 7,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+
+## Lipids
+
+### Biological Aging Lipids [Changing with FLL]
+
+```{r lipid_bioage}
+bioage_lipid_categories <- c("Lipids with 24:1", "Phosphatidylcholine Lipids", "Phytosterol sulfates")
+
+feature_subset <- lipidomics_features %>%
+  filter(category_label %in% bioage_lipid_categories)
+
+lipid_bioage_grob <- visualize_feature_subsets(
+  feature_subset,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "category_label"
+  )
+```
+
+```{r main_text_metabolites_and_lipids, fig.height = 12, fig.width = 25}
+main_text_metabolites_and_lipids_grob <- (aging_core_metabolites_grob + theme(legend.position = "none")) +
+  guide_area() +
+  lipid_bioage_grob +
+  plot_layout(
+    guides = "collect",
+    widths = c(1, 0.2, 1),
+    design = c(
+      "
+      ABC
+      "
+    ))
+
+main_text_metabolites_and_lipids_grob
+create_and_upload_figure(
+  name = "main_text_metabolites_and_lipids",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6",
+  width = 25,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### All Non-FLL Aging Lipids
+
+```{r all_aging_lipids, fig.height = 20, fig.width = 24}
+feature_subset <- lipidomics_features %>%
+  filter(!(category_label %in% bioage_lipid_categories))
+
+lipid_chronage_grob <- visualize_feature_subsets(
+  feature_subset,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "category_label"
+  )
+
+lipid_chronage_grob
+create_and_upload_figure(
+  name = "lipid_chronage",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 24,
+  height = 20,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Proteins
+
+### Manually Organized Protein Categories
+
+```{r protein_man_category, fig.height = 30, fig.width = 36}
+curated_protein_features <- proteomics_features_annotated %>%
+  filter(!is.na(manual_general_category))
+
+curated_proteins_grob <- visualize_feature_subsets(
+  curated_protein_features,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "manual_category"
+  )
+
+curated_proteins_grob
+create_and_upload_figure(
+  name = "curated_proteins",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Extras",
+  width = 36,
+  height = 30,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Proteins Related to the ECM
+
+```{r ecm, fig.height = 13, fig.width = 16}
+ecm_features <- proteomics_features_annotated %>%
+  filter(manual_general_category %in% c("Clotting", "ECM"))
+
+ecm_grob <- visualize_feature_subsets(
+  ecm_features,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "manual_category"
+  )
+
+ecm_grob
+create_and_upload_figure(
+  name = "ecm",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 16,
+  height = 13,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Proteins Related to Innate Immunity + Immune Phenotypes
+
+```{r immunity, fig.height = 13, fig.width = 16}
+immune_features <- dplyr::bind_rows(
+  proteomics_features_annotated %>%
+    filter((manual_general_category %in% "Immunity") | (manual_category == "Wound\\nhealing")),
+  lifespan_hits_features %>%
+    filter(data_modality == "non-omics") %>%
+    mutate(
+      manual_category = case_when(
+        stringr::str_detect(feature_label, "mono") ~ "Monocytes &\nMacrophages",
+        stringr::str_detect(feature_label, "cd11b") ~ "Monocytes &\nMacrophages",
+        stringr::str_detect(feature_label, "neut") ~ "Neutrophils",
+        stringr::str_detect(feature_label, "gran") ~ "Neutrophils",
+        .default = "Other non-omics"
+      )) %>%
+    filter(manual_category != "Other non-omics")
+)
+ 
+innate_immunity_grob <- visualize_feature_subsets(
+  immune_features,
+  lifespan_hits_features_with_design,
+  top_partial_corrs,
+  facet_by = "manual_category"
+  )
+
+innate_immunity_grob
+create_and_upload_figure(
+  name = "innate_immunity",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 16,
+  height = 13,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+#### Monocytes vs. LBP
+
+```{r lbp_immune_exposure, fig.height = 4, fig.width = 6}
+lbp_immune_exposure <- lifespan_hits_features_with_design %>%
+  filter(gene == "Lbp" | feature_label %in% c("facs - cd11b", "facs - mono_pct")) %>%
+  dplyr::select(data_modality, feature_name, feature_label, unique_sample_id, lifespan, Age, fraction_of_life_lived, corrected_log2_abundance)
+
+lbp_immune_scatter_data <- lbp_immune_exposure %>%
+  filter(data_modality == "proteomics") %>%
+  dplyr::select(unique_sample_id:corrected_log2_abundance) %>%
+  left_join(
+    lbp_immune_exposure %>%
+      filter(data_modality == "non-omics") %>%
+      dplyr::select(
+        feature_label,
+        unique_sample_id,
+        non_omics_abund = corrected_log2_abundance
+        ) %>%
+      # undo sqrt transformation (and then put it back in place for scatter plot)
+      mutate(non_omics_abund = non_omics_abund^2),
+    by = "unique_sample_id"
+  ) %>%
+  mutate(feature_label = case_when(
+    feature_label == "facs - cd11b" ~ "Percent CD11b+",
+    feature_label == "facs - mono_pct" ~ "Percent monocytes"
+  ))
+
+lbp_immune_grob <- ggplot(lbp_immune_scatter_data, aes(y = corrected_log2_abundance, x = non_omics_abund)) +
+  facet_wrap(~ feature_label, scale = "free_x") +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, formula = "y ~ x") +
+  scale_x_sqrt("FACS Measurement") +
+  scale_y_continuous(expression("Lbp" ~ log[2] ~ "abundance")) +
+  theme_bw() +
+  ggpubr::stat_cor(method = "spearman", label.x = 2, label.y = 2.2, cor.coef.name = "rho", color = "blue")
+
+lbp_immune_grob
+create_and_upload_figure(
+  name = "lbp_immune",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 6,
+  height = 4,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Proteostasis
+
+```{r proteostasis, fig.height = 13, fig.width = 16}
+proteostasis_features <- proteomics_features_annotated %>%
+   filter(
+     case_when(
+       manual_general_category %in% c("Misc Protease (inhibitors)") ~ TRUE,
+       manual_category == "Cathepsin" ~ TRUE,
+       .default = FALSE
+     ))
+
+proteostasis_grob <- visualize_feature_subsets(
+  proteostasis_features,
+  features_with_design,
+  top_partial_corrs,
+  facet_by = "manual_category"
+  )
+
+proteostasis_grob
+create_and_upload_figure(
+  name = "proteostasis",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 16,
+  height = 13,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+### Homeostasis
+
+```{r homeostasis, fig.height = 13, fig.width = 16}
+homeostasis_features <- dplyr::bind_rows(
+  proteomics_features_annotated %>%
+    filter(manual_general_category %in% c("FAM20C", "Homeostasis")),
+  lifespan_hits_features %>%
+    filter(data_modality == "non-omics") %>%
+    mutate(
+      manual_category = case_when(
+        stringr::str_detect(feature_label, "igf1") ~ "IGF Signaling"
+      )) %>%
+    mutate(feature_label == "igf1") %>%
+    filter(manual_category != "Other non-omics")
+)
+ 
+homeostasis_grob <- visualize_feature_subsets(
+  homeostasis_features,
+  lifespan_hits_features_with_design,
+  top_partial_corrs,
+  facet_by = "manual_category"
+  )
+
+homeostasis_grob
+create_and_upload_figure(
+  name = "homeostasis",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure6/Supp",
+  width = 16,
+  height = 13,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```

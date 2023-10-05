@@ -1,0 +1,346 @@
+---
+title: "Figure 4 - Side Analysis - Volcano Plots and Signed-Significance Plots"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+library(patchwork)
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# read results from GCP and locally cache results
+domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
+
+# load specific files
+tidy_omics <- load_domics("tomic", domics_paths)
+domics_signif <- load_domics("signif", domics_paths) %>%
+  filter(data_modality %in% c("metabolomics", "proteomics", "lipidomics"))
+feature_design_list <- load_domics("feature_design_list", domics_paths)
+
+features <- romic::get_tomic_table(tidy_omics, "features")
+samples <- romic::get_tomic_table(tidy_omics, "samples")
+
+# script-specific setup
+# load gsea results from  and cleaned up metadata from figure_3.Rmd
+figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
+figure_4_out <- readRDS(file = file.path(params$cache_dir, "figure_4_out.RDS"))
+
+source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+
+### Load SHOCK mouse phenotypes
+#source(file.path(params$repo_path, "utils/data_prep.R"))
+#mouse_phenotypes <- load_mouse_phenotypes(params$shock_token, reduced_phenotypes = FALSE)
+
+overwrite = FALSE
+```
+
+## Volcanos
+
+```{r volcano_setup}
+volcano_terms <- figure_3_out$feature_signif_w_alt_terms %>%
+  distinct(term) %>%
+  # match gsea terms to feature significance
+  dplyr::filter(term %in% c("ddm", "sex", "fraction of life lived", "early age (fc)", "late age (fc)", "late age x lifespan (fc)", "lifespan | age", "lifespan remaining", "early G8", "late blood draw")) %>%
+  add_term_labels() %>%
+  mutate(term_signif = stringr::str_replace(term, " ?[\\(\\|][A-Za-z \\)]+$", ""))
+
+per_day_vars <- c("late age x lifespan", "lifespan remaining", "lifespan")
+non_day_vars <- c("ddm", "sex", "early age", "late age", "fraction of life lived")
+batch_vars <- c("early G8", "late blood draw")
+
+select_effect_sizes <- domics_signif %>%
+  filter(!is.na(q.value)) %>%
+  filter(term %in% c(per_day_vars, non_day_vars, batch_vars)) %>%
+  mutate(
+    nlog10_pvalue = -1*log10(pvalue_bs),
+    nlog10_pvalue_w_ols = case_when(
+      pvalue_bs == 1e-6 & pvalue_ols < pvalue_bs ~ -1*log10(pvalue_ols),
+      TRUE ~ nlog10_pvalue
+    ),
+    signed_nlog10_pvalue = nlog10_pvalue * ifelse(estimate > 0, 1, -1),
+    signif = ifelse(q.value < 0.1, "q < 0.1", "n.s."),
+    scaled_effect_size = estimate * 100
+  ) %>%
+  select(term, data_type, data_modality, groupId, feature_name, estimate, scaled_effect_size, nlog10_pvalue, nlog10_pvalue_w_ols, signed_nlog10_pvalue, signif)
+
+# exclude non-aging categories (ddm and sex) from assigning features -> aging mode
+fxnl_category_assignments <- figure_3_out$gsea_hits %>%
+  inner_join(volcano_terms, by = "term") %>%
+  filter(term_signif %in% c(per_day_vars, "early age", "late age", "fraction of life lived")) %>%
+  left_join(figure_3_out$go_hit_colorscheme, by = c("category", "value" = "category_value")) %>%
+  select(data_modality:value, term_label, term_signif, qvalue, category_label:category_color) %>%
+  unnest(members) %>%
+  # assign each feature to its most significant category
+  group_by(term_signif, data_type, groupId) %>%
+  arrange(qvalue) %>%
+  slice(1) %>%
+  ungroup()
+  
+select_effect_sizes_annotated <- select_effect_sizes %>%
+  # add categories and color scheme
+  left_join(fxnl_category_assignments, by = c("term" = "term_signif", "data_modality", "data_type", "groupId")) %>%
+  inner_join(volcano_terms %>% select(term_signif, term_label_simple), by = c("term" = "term_signif")) %>%
+  # add features to highlight
+  left_join(
+    figure_4_out$top_longevity_hits_in_pathways %>%
+      dplyr::select(data_modality, data_type, groupId, highlight_label = feature_label),
+    by = c("data_modality", "data_type", "groupId")
+  ) %>%
+  mutate(
+    highlight_label = ifelse(signif == "n.s.", NA, highlight_label),
+    highlight_label = ifelse(is.na(category_general_label), NA, highlight_label),
+    category_general_label = ifelse(is.na(category_general_label), "Other", category_general_label)
+    )
+```
+
+```{r lifespan_volcanos, fig.height = 20, fig.width = 15}
+plot_volcanos <- function (
+  select_effect_sizes_annotated,
+  select_terms,
+  scale_for_per_day_effect_sizes = FALSE,
+  x_breaks = round(seq(-0.3, 0.3, by = 0.1), 1)
+  ) {
+  
+  checkmate::assertLogical(scale_for_per_day_effect_sizes, len = 1)
+  if (scale_for_per_day_effect_sizes) {
+    estimate_var <- "scaled_effect_size"
+    x_axis_label <- expression("Regression" ~ log[2] ~ "fold-change Per 100 Days")
+  } else {
+    estimate_var <- "estimate"
+    x_axis_label <- expression("Regression" ~ log[2] ~ "fold-change")
+  }
+  
+  ordered_fxnl_categories <- select_effect_sizes_annotated %>%
+    filter(category_general_label != "Other") %>%
+    distinct(data_modality, category_general_label, qvalue, term, category_color) %>%
+    arrange(desc(data_modality), qvalue) %>%
+    group_by(category_general_label, category_color) %>%
+    slice(1) %>%
+    arrange(desc(data_modality), qvalue)
+  
+  ordered_fxnl_categories_vec <- c(ordered_fxnl_categories$category_color, "gray50")
+names(ordered_fxnl_categories_vec) <- c(ordered_fxnl_categories$category_general_label, "Other")
+
+  ordered_terms_by_select_terms <- select_effect_sizes_annotated %>%
+    filter(term %in% select_terms) %>%
+    distinct(term, term_label_simple) %>%
+    mutate(term = factor(term, levels = select_terms)) %>%
+    arrange(term) %>%
+    mutate(term_label_simple_fct = factor(term_label_simple, levels = term_label_simple))
+
+  subset_select_effect_sizes_annotated <- select_effect_sizes_annotated %>%
+    inner_join(ordered_terms_by_select_terms, by = c("term", "term_label_simple"))
+  
+  volcano_grob <- subset_select_effect_sizes_annotated %>%
+    arrange(desc(category_general_label), desc(nlog10_pvalue)) %>%
+    ggplot(aes(x = !!rlang::sym(estimate_var), y = nlog10_pvalue_w_ols, color = category_general_label)) +
+    geom_point(aes(size = signif)) +
+    ggrepel::geom_label_repel(
+      data = subset_select_effect_sizes_annotated %>%
+        filter(!is.na(highlight_label)) %>%
+        mutate(label_background = case_when(
+          category_general_label %in% light_label_categories ~ "white",
+          TRUE ~ "gray20"
+        )),
+      aes(label = highlight_label, fill = label_background),
+      label.padding = unit(0.1, "lines"), alpha = 1, size = 2,
+      fontface = "bold", max.overlaps = 20) +
+    scale_fill_identity() +
+    facet_grid(term_label_simple_fct ~ ., scale = "free", space = "free") +
+    scale_x_continuous(x_axis_label, breaks = x_breaks) +
+    scale_y_continuous(expression(-log[10] ~ "p-value")) +
+    scale_size_manual("Significance", values = c("q < 0.1" = 1, "n.s." = 0.5)) +
+    scale_color_manual(
+      "Category",
+      values = ordered_fxnl_categories_vec,
+      breaks = ordered_fxnl_categories_vec
+      ) +
+    theme_bw() +
+    theme(text = element_text(size = 14), legend.position = "bottom", panel.grid.minor = element_blank()) +
+    guides(color = guide_legend(override.aes = list(size=5), nrow = 2), size = guide_legend(nrow = 2)) +
+    coord_cartesian(xlim = c(min(x_breaks), max(x_breaks)))
+  
+  volcano_grob
+}
+
+lifespan_volcano_grob <- plot_volcanos(
+  select_effect_sizes_annotated,
+  select_terms = per_day_vars,
+  scale_for_per_day_effect_sizes = TRUE
+  )
+
+ddm_sex_volcano_grob <- plot_volcanos(
+  select_effect_sizes_annotated,
+  select_terms = c("ddm", "sex"),
+  x_breaks = seq(-3, 3, by = 1)
+  )
+
+aging_volcano_grob <- plot_volcanos(
+  select_effect_sizes_annotated,
+  select_terms = c("early age", "late age", "fraction of life lived"),
+  x_breaks = seq(-3, 3, by = 1)
+)
+
+combined_volcano_grob <- ddm_sex_volcano_grob +
+  lifespan_volcano_grob +
+  aging_volcano_grob +
+  guide_area() +
+  plot_layout(
+    guides = 'collect',
+    heights = c(2, 3, 3, 0.02),
+    design = c(
+    "
+    AA
+    BB
+    CC
+    DX
+    "
+  ))
+
+combined_volcano_grob
+create_and_upload_figure(
+  name = "combined_volcano",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 15,
+  height = 20,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+## Effect Size Comparisons
+
+```{r biv_plots_setup}
+ordered_aging_modes <- c("lifespan", "early age", "late age", "fraction of life lived", "late age x lifespan", "lifespan remaining", "ddm")
+ordered_aging_modes_w_batchvars <- c(ordered_aging_modes, batch_vars)
+
+ordered_bivariate_terms <- volcano_terms %>%
+  filter(term_signif %in% ordered_aging_modes_w_batchvars) %>%
+  mutate(term_signif = factor(term_signif, levels = ordered_aging_modes_w_batchvars)) %>%
+  arrange(term_signif) %>%
+  mutate(term_label_simple_fct = ordered(term_label_simple, levels = term_label_simple)) %>%
+  select(term = term_signif, term_label_simple_fct)
+  
+select_effect_sizes_compared <- select_effect_sizes_annotated %>%
+  inner_join(ordered_bivariate_terms, by = "term") %>%
+  select(term = term_label_simple_fct, data_type, data_modality, groupId, feature_name, signed_nlog10_pvalue, signif, category_general_label, category_color, highlight_label) %>%
+   mutate(category_color = forcats::fct_na_value_to_level(category_color, "gray50"))
+
+paired_terms <- select_effect_sizes_compared %>%
+  inner_join(
+    select_effect_sizes_compared %>% select(-category_general_label, -category_color, -highlight_label),
+    by = c("data_type", "data_modality", "groupId", "feature_name"),
+    relationship = "many-to-many"
+  ) %>%
+  # ignore term x == term y and drop the symmetrical comparison between x-y and y-x
+  filter(term.x < term.y) %>%
+  mutate(signif_category = dplyr::case_when(
+    signif.x == "n.s." & signif.y == "n.s." ~ "n.s.",
+    signif.x == "n.s." ~ glue::glue("{term.y}"),
+    signif.y == "n.s." ~ glue::glue("{term.x}"),
+    TRUE ~ glue::glue("{term.x} and {term.y}")
+  ))
+```
+
+```{r hexbin_bivs, fig.height = 10, fig.width = 10}
+cross_term_effect_cors <- paired_terms %>%
+  group_by(term.x, term.y) %>%
+  summarize(
+    corr = cor(
+      signed_nlog10_pvalue.x,
+      signed_nlog10_pvalue.y,
+      method = "pearson"
+    ),
+    .groups = "drop"
+    ) %>%
+  mutate(lab = glue::glue("R2 = {as.character(round(corr^2, 2))}"))
+
+ordered_aging_modes_trans <- ordered_bivariate_terms$term_label_simple_fct[
+  ordered_bivariate_terms$term %in% c("lifespan", "early age", "late age", "fraction of life lived", "late age x lifespan", "lifespan remaining", "ddm")]
+batch_vars_trans <- ordered_bivariate_terms$term_label_simple_fct[
+  ordered_bivariate_terms$term %in% c("early G8", "late blood draw")]
+  
+hexbin_bivs <- paired_terms %>%
+  filter(
+    term.x %in% ordered_aging_modes_trans,
+    term.y %in% ordered_aging_modes_trans
+    ) %>%
+  ggplot(aes(x = signed_nlog10_pvalue.x, y = signed_nlog10_pvalue.y)) +
+  geom_hex(bins = 30) +
+  geom_text(
+    data = cross_term_effect_cors %>%
+      filter(
+        term.x %in% ordered_aging_modes_trans,
+        term.y %in% ordered_aging_modes_trans
+        ), x = -6, y = 6, aes(label = lab), size = 2, hjust = 0, vjust = 1) +
+  scale_fill_gradientn(colors = c("gray80", "gray50", "orange", "firebrick"), trans = "log2", breaks = 2^(0:6)) +
+  facet_grid(fct_rev(term.y) ~ fct_rev(term.x)) +
+  theme_bw() +
+  scale_x_continuous(expression("x-facet signed" ~ -log[10] ~ "p-value")) +
+  scale_y_continuous(expression("y-facet signed" ~ -log[10] ~ "p-value"))
+  
+hexbin_bivs
+create_and_upload_figure(
+  name = "hexbin_bivs",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 12,
+  height = 12,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+```
+
+
+```{r hexbin_bivs_batch, fig.height = 4, fig.width = 12}
+hexbin_bivs_batch <- paired_terms %>%
+  filter(
+    term.y %in% batch_vars_trans
+    ) %>%
+  ggplot(aes(x = signed_nlog10_pvalue.x, y = signed_nlog10_pvalue.y)) +
+  geom_hex(bins = 30) +
+  geom_text(
+    data = cross_term_effect_cors %>%
+      filter(
+        term.y %in% batch_vars_trans
+        ), x = -6, y = 6, aes(label = lab), size = 2, hjust = 0, vjust = 1) +
+  scale_fill_gradientn(colors = c("gray80", "gray50", "orange", "firebrick"), trans = "log2", breaks = 2^(0:6)) +
+  facet_grid(fct_rev(term.y) ~ fct_rev(term.x)) +
+  theme_bw() +
+  scale_x_continuous(expression("x-facet signed" ~ -log[10] ~ "p-value")) +
+  scale_y_continuous(expression("y-facet signed" ~ -log[10] ~ "p-value"))
+  
+hexbin_bivs_batch
+create_and_upload_figure(
+  name = "hexbin_bivs_batch",
+  update_figures = params$update_figures,
+  drive_path = "Figures/Figure4/Supp",
+  width = 14,
+  height = 4,
+  tmp_figure_dir = params$figures_dir,
+  extensions = c(".png", ".pdf")
+)
+
+```

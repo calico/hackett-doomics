@@ -1,0 +1,211 @@
+---
+title: "Proteomics Featurization"
+author: "mmagzoub"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+params:
+  set: "123"
+  max_percent_missing: 0.50
+tags:
+- "diversity outcross"
+- "proteomics"
+- "biomarkers"
+---
+
+```{r package_loading, message = FALSE, warning = FALSE}
+library(tidyverse)
+
+run_params <- append(
+  params,
+  list(
+    dataset_path = file.path(Sys.getenv("doomics_zfs_root"), "data"),
+    path_to_do_github = Sys.getenv("doomics_repo_path"),
+    run_outdir = file.path(Sys.getenv("doomics_zfs_root"), Sys.getenv("doomics_out_base_dir"), "proteomics")
+    ))
+
+if (!file.exists(run_params$run_outdir)) {
+  dir.create(run_params$run_outdir)
+  dir.create(file.path(run_params$run_outdir, "out_files"))
+  dir.create(file.path(run_params$run_outdir, "out_figures"))
+}
+
+#knitr::kable(tibble::tibble(parameters = names(run_params),
+#                            values = unname(unlist(run_params))))
+
+source(file.path(run_params$path_to_do_github, "bioinformatics", "utils", "data_prep.R"))
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(
+  fig.path = file.path(run_params$run_outdir, "out_figures/"),
+  out.width='2000px',
+  dpi = 200
+)
+```
+
+
+# Load Data and Meta-data
+
+```{r data_loading, warning = FALSE, message = FALSE}
+
+format_protein_table <- function(dataset_path, design_matrix){
+  protein.ra <- readr::read_csv(dataset_path)
+  cols.fc <- colnames(protein.ra)[stringr::str_starts(colnames(protein.ra), 'Est_Fc')]
+  cols.var <- colnames(protein.ra)[stringr::str_starts(colnames(protein.ra), 'Var')]
+  n.obs <- length(cols.fc)
+  
+  # TODO: best way to annotate Genes w/o names. Just using the protein ID for now
+  protein.ra <- protein.ra %>% dplyr::mutate(NameUnique = glue::glue("{Gene}", "{Protein}", .sep = '_', .na = ''))
+  protein.ra[is.na(protein.ra$Gene), 'NameUnique'] <-  protein.ra[is.na(protein.ra$Gene), 'Protein']
+  
+  protein.obs <- dplyr::bind_cols(
+    # Gather columns with relative abundance statistics from compms
+    protein.ra %>%
+      dplyr::select(all_of(cols.fc)) %>%
+      tidyr::gather(key = 'condition', value = 'log2.RA'),
+    # Gather columns with variance statistics from compms
+    protein.ra %>%
+      dplyr::select(all_of(cols.var)) %>%
+      tidyr::gather(value = 'variance') %>%
+      dplyr::select(variance)
+    ) %>% 
+    # Format sample number
+    mutate('condition' = stringr::str_sub(condition, start = 7))
+  
+  protein.obs <- 
+    # Add columns for 'keys' 
+    dplyr::bind_cols('NameUnique' = rep(protein.ra$NameUnique, times = n.obs),
+                     'GeneName' = rep(protein.ra$Gene, times = n.obs),
+                     'ProteinId' = rep(protein.ra$Protein, times = n.obs),
+                     protein.obs) %>%
+    # remove NA entries (plexes where peptide was not measured)
+    dplyr::filter(!is.na(log2.RA)) %>%
+    # remove measurements from channels which don't have matched samples
+    # dplyr::filter(condition %in% design_matrix$condition) %>%
+    # add sample_ID annotations
+    dplyr::inner_join(design_matrix, by = 'condition') %>%
+    dplyr::select(NameUnique, GeneName, ProteinId, sample_id, unique_batch, log2.RA, variance)
+  
+  protein.obs
+}
+
+DOBATCH1.design.matrix <- readr::read_csv(file.path(run_params$dataset_path, 'proteomics/in_files/compms/design_matrix_DOBATCH1_TRYPSIN_30AUG2019.csv')) %>%
+  dplyr::mutate('condition' = as.character(condition),
+                # format sample_id which is set_name for DOBATCH1
+                'sample_id' = stringr::str_c(set, '_', stringr::str_sub(name, 3)),
+                'unique_batch' = stringr::str_c(set, '_', batch)) %>%
+  select(condition, sample_id, unique_batch)
+DOBATCH1.compms.RA <- format_protein_table(file.path(run_params$dataset_path, 'proteomics/in_files/compms/comp_ms_308_std_refcond_1_fcAvg_simple_mod_DOBATCH1.csv'), DOBATCH1.design.matrix)
+
+
+DOBATCH2.design.matrix <- readr::read_csv(file.path(run_params$dataset_path, 'proteomics/in_files/compms/design_matrix_MCA_DOBATCH2_MCA_TRYPSIN_23AUG2019_03DEC2019.csv')) %>%
+  mutate('condition' = as.character(condition),
+         # format sample_id which is set_name for DOBATCH1
+         'sample_id' = stringr::str_c('3_', s), 
+         'unique_batch' = stringr::str_c('3_', batch)) %>%
+  select(condition, sample_id, unique_batch)
+DOBATCH2.compms.RA <- format_protein_table(file.path(run_params$dataset_path, 'proteomics/in_files/compms/comp_ms_328_std_refcond_1_fcAvg_simple_mod_DOBATCH2.csv'), DOBATCH2.design.matrix)
+
+n_samples <- nrow(DOBATCH1.design.matrix) + nrow(DOBATCH2.design.matrix)
+
+compms.RA <- bind_rows(DOBATCH1.compms.RA, DOBATCH2.compms.RA)
+
+```
+# Proteins
+
+### Are there systematic differences between the averages of each 10 plex after normalizing with respect to their bridge?
+
+It looks like there is quite a bit of variability in bridge samples and that they cluster with an unclear structure -- this suggests that bridge samples may not be directly comparable. This comparison is not entirely fair however; a structure like this could exist while still allowing for the correction of batch effects on samples if samples were similarly affected by the above technical structure. Instead, we can look for structure in bridge-corrected samples after smoothing out most biological signals by averaging over all samples within a TMT batch.
+
+```{r tmt_ra_correlations, fig.align = "center"}
+batch_average_RA_matrix <- compms.RA %>%
+  dplyr::group_by(NameUnique, unique_batch) %>%
+  dplyr::summarize(batch.avg.RA = mean(log2.RA)) %>%
+  dplyr::group_by(NameUnique) %>%
+  dplyr::filter(n() > 10) %>%
+  dplyr::mutate(centered.batch.avg.RA = batch.avg.RA - mean(batch.avg.RA)) %>%
+  dplyr::mutate(thresholded.batch.avg.RA = pmax(pmin(centered.batch.avg.RA, 3),-3)) %>%
+  reshape2::acast(formula = NameUnique ~ unique_batch, value.var = "thresholded.batch.avg.RA")
+
+# This signature is some peptides being abundant in set1 relative to set2 or vice-versa
+pheatmap::pheatmap(cor(batch_average_RA_matrix, use = "pairwise.complete.obs"))
+```
+
+For experimental samples, it looks like the average has a strong block-diagonal structure whereas batches are relatively independent within a set -- this is good! We, need to adjust for the large quantitative difference in set1 vs. set2, but once this is done, batches effects should be nicely corrected.
+
+## Normalize batch effects
+
+The relative magnitude of experimental samples w.r.t. the bridge is meaningful, since it will be a shared offset across peptides from the same protein. Centering peptides seperately within each set would deal with batch effects but abolish the average magnitudes of samples relative to the bridge (this could cause lots of problems when averaging peptides with different missing values!). To correct for the difference between set 1 and set 2, set1 and set2 peptides are centered and then the overall mean is added back.
+
+```{r batch_correction}
+compms.RA <- compms.RA %>% mutate('set' = stringr::str_sub(sample_id, 1, 1))
+
+protein_set_specific_adjustments <- compms.RA %>%
+  # adjust for difference b/w set1 and set2 while minimizing the change in original values
+  dplyr::group_by(NameUnique, set) %>%
+  dplyr::summarize(n.samples = n(), setMean.log2.RA = mean(log2.RA)) %>%
+  dplyr::group_by(NameUnique) %>%
+  dplyr::mutate(globalMean.log2.RA = sum(setMean.log2.RA * n.samples) / sum(n.samples),
+                adjSetMean.log2.RA = globalMean.log2.RA - setMean.log2.RA) %>%
+  dplyr::select(NameUnique, set, adjSetMean.log2.RA)
+
+normalized_peptide_RA <- compms.RA %>%
+  dplyr::left_join(protein_set_specific_adjustments, by = c("NameUnique", "set")) %>%
+  dplyr::mutate(normalized.log2.RA = log2.RA + adjSetMean.log2.RA) %>%
+  dplyr::select(-adjSetMean.log2.RA)
+
+# confirm that the adjustment worked - all sets should have the same mean for a given peptide
+sd_set_means <- normalized_peptide_RA %>%
+  dplyr::group_by(NameUnique, set) %>%
+  dplyr::summarize(mean.log2.RA = mean(normalized.log2.RA)) %>%
+  dplyr::group_by(NameUnique) %>%
+  dplyr::summarize(sdSetMean = sd(mean.log2.RA)) %>%
+  dplyr::select(sdSetMean) %>%
+  unlist() %>% unname()
+
+if (any(sd_set_means[!is.na(sd_set_means)] > 1e-14)) {
+  stop("sets have different means after enforcing that they should have the same mean")
+}
+```
+
+
+Normalization was successful in removing correlation structure in mean abundance within batches.
+
+```{r batch_post_correction}
+batch_average_RA_matrix_post_correction <- normalized_peptide_RA %>%
+  dplyr::group_by(NameUnique, unique_batch) %>%
+  dplyr::summarize(batch.avg.RA = mean(normalized.log2.RA)) %>%
+  dplyr::group_by(NameUnique) %>%
+  dplyr::filter(n() > 10) %>%
+  dplyr::mutate(centered.batch.avg.RA = batch.avg.RA - mean(batch.avg.RA)) %>%
+  dplyr::mutate(thresholded.batch.avg.RA = pmax(pmin(centered.batch.avg.RA, 3),-3)) %>%
+  reshape2::acast(formula = NameUnique ~ unique_batch, value.var = "thresholded.batch.avg.RA")
+
+pheatmap::pheatmap(cor(batch_average_RA_matrix_post_correction, use = "pairwise.complete.obs"))
+```
+
+# Output
+
+### Write dataset containing normalized and unnormalized peak abundances
+
+```{r}
+compms.RA <- normalized_peptide_RA %>%
+  mutate(Subcatagory = NA, data_type = 'CompMS') %>%
+  select(NameUnique, GeneName, ProteinId, sample_id, set, normalized.log2.RA, variance, Subcatagory, data_type, unique_batch)
+
+# filter proteins missing data for greater than "max_percent_missing" of samples
+compms.RA <- compms.RA %>%
+  dplyr::semi_join(compms.RA %>%
+                     dplyr::count(NameUnique) %>%
+                     dplyr::filter(n > n_samples - (n_samples * run_params$max_percent_missing)), 
+                   by = 'NameUnique')
+
+saveRDS(compms.RA, file.path(run_params$run_outdir, 'out_files/compms_proteomics_features.RDS'))
+```
+
+
