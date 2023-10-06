@@ -7,3 +7,4 @@
 rsconnect
 *.html
 *cache*
+*files*
