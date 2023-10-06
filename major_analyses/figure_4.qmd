@@ -51,7 +51,6 @@ features_with_design <- load_doomics("features",  params$cache_dir)
 
 # raw model fits
 signif_all_models <- load_doomics("signif_all_models", params$cache_dir)
-qlts <- load_doomics("qtl_results", params$cache_dir)
 model_summaries <- signif_all_models %>%
   dplyr::select(-params, -fits) %>%
   tidyr::unnest(model_summary) %>%

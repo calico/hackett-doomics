@@ -1,5 +1,4 @@
 setup_figure_params <- function (config_path = "config.json") {
-  
   # read config
   
   if (!file.exists(config_path) && !file.exists(config_path)) {
@@ -28,6 +27,9 @@ setup_figure_params <- function (config_path = "config.json") {
     manuscript_drive_root = Sys.getenv("doomics_manuscript_uri"),
     repo_path = dirname(getwd())
   )
+  
+  # update options to avoid timeout when downloading large files
+  options("timeout" = 10000)
   
   if (basename(params$repo_path) != "hackett-doomics") {
     cli::cli_abort(
@@ -74,10 +76,10 @@ setup_figure_params <- function (config_path = "config.json") {
 }
 
 load_doomics <- function (
-    an_asset = NULL,
-    outdir = "/tmp/doomics/data",
-    overwrite = FALSE
-    ) {
+  an_asset = NULL,
+  outdir = "/tmp/doomics/data",
+  overwrite = FALSE
+  ) {
   
   # Download data and modeling results
   
@@ -120,7 +122,8 @@ load_doomics <- function (
   
   available_assets_table <- function(doomics_available_assets) {
     # internal function
-    doomics_available_assets %>% select(asset, description) %>%
+    doomics_available_assets %>%
+      dplyr::select(asset, description) %>%
       mutate(description = stringr::str_wrap(description, 50)) %>%
       knitr::kable() %>%
       kableExtra::kable_styling() %>%
@@ -180,7 +183,15 @@ load_doomics <- function (
   return(return_functional(asset_local_path))
 }
 
-create_and_upload_figure <- function (grob = NULL, params, name, drive_path, width, height, extensions = ".pdf") {
+create_and_upload_figure <- function (
+  grob = NULL,
+  params,
+  name,
+  drive_path,
+  width,
+  height,
+  extensions = ".pdf"
+  ) {
   
   # ggsave to a local file and add local plots to gDrive if update_figures is TRUE
   
@@ -192,7 +203,7 @@ create_and_upload_figure <- function (grob = NULL, params, name, drive_path, wid
   checkmate::assertLogical(params$update_figures, len = 1)
   if (!params$update_figures) {
     # no upload needed
-    return (NULL)
+    return (invisible(0))
   }
   
   checkmate::assertCharacter(extensions)
@@ -276,7 +287,11 @@ add_term_labels <- function(terms_df) {
     )
 }
 
-get_subset_correlation <- function (feature_names, all_phenotype_abundances, cor_method = "spearman") {
+get_subset_correlation <- function (
+  feature_names,
+  all_phenotype_abundances,
+  cor_method = "spearman"
+  ) {
   
   checkmate::assertDataFrame(all_phenotype_abundances)
   purrr::walk(feature_names, ~ checkmate::assertChoice(., unique(all_phenotype_abundances$feature_name)))
@@ -302,7 +317,11 @@ get_subset_correlation <- function (feature_names, all_phenotype_abundances, cor
 
 # Figure 3
 
-calculate_category_enrichment <- function (category_members, all_analytes, term_hits) {
+calculate_category_enrichment <- function (
+  category_members,
+  all_analytes,
+  term_hits
+  ) {
   
   # generate 2x2 table for a functional enrichment and apply a Fisher Exact
   # test of enrichment for category membership among differential
@@ -333,10 +352,19 @@ calculate_category_enrichment <- function (category_members, all_analytes, term_
       category_size = nrow(category_members)
     ) %>%
     # add a table with category hits
-    crossing(tidyr::nest(category_hits_df %>% select(data_type, groupId), category_hits_df = c(data_type, groupId)))
+    crossing(
+      tidyr::nest(
+        category_hits_df %>%
+          select(data_type, groupId),
+        category_hits_df = c(data_type, groupId)
+        ))
 }
 
-drop_degenerate_categories <- function (term_discoveries, term_signif_hits, jaccard_cutoff = 0.7) {
+drop_degenerate_categories <- function (
+  term_discoveries,
+  term_signif_hits,
+  jaccard_cutoff = 0.7
+  ) {
   
   # flag degenerate functional categories which are less significant
   # than another category and have highly overlapping membership
@@ -373,7 +401,11 @@ drop_degenerate_categories <- function (term_discoveries, term_signif_hits, jacc
     
     # drop all lower significance degenerate term
     terms_to_drop <- new_term %>%
-      inner_join(degenerate_go_terms, by = c("category" = "category1", "value" = "value1"), multiple = "all")
+      inner_join(
+        degenerate_go_terms,
+        by = c("category" = "category1", "value" = "value1"),
+        multiple = "all"
+        )
     
     if (nrow(terms_to_drop) > 0) {
       running_terms <- running_terms %>%
@@ -485,7 +517,11 @@ light_label_categories <- c(
 # Figure 5
 
 
-min_dmeasure <- function (sample_dat, dmeasure_method = "lm", dmeasure_vals = seq(-10, 10, by = 0.001)) {
+min_dmeasure <- function (
+    sample_dat,
+    dmeasure_method = "lm",
+    dmeasure_vals = seq(-10, 10, by = 0.001)
+    ) {
   
   checkmate::assertDataFrame(sample_dat)
   checkmate::assertChoice(dmeasure_method, c("mle", "lm"))
@@ -530,7 +566,11 @@ min_dmeasure <- function (sample_dat, dmeasure_method = "lm", dmeasure_vals = se
   return(min_dmeasure)
 }
 
-infer_age_measure_given_go <- function(members, an_aging_archetype, signif_all_models) {
+infer_age_measure_given_go <- function(
+    members,
+    an_aging_archetype,
+    signif_all_models
+    ) {
   
   aging_archetype_attrs <- age_driver_model_definitions %>%
     dplyr::filter(aging_archetype == an_aging_archetype) %>%
@@ -644,7 +684,12 @@ create_aging_measures_heatmap <- function (go_age_measures, samples) {
   return(aging_measures_sample_heatmap)
 }
 
-calculate_cross_group_distance <- function(category_data_1, category_data_2, feature_feature_similarity, n_permutations = 100) {
+calculate_cross_group_distance <- function(
+  category_data_1,
+  category_data_2,
+  feature_feature_similarity,
+  n_permutations = 100
+  ) {
   
   # add intersection to the smaller category so that we can compare
   # a nested gene set to its parent category (i.e., protein catabolism to proteolysis)
