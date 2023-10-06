@@ -1,66 +1,90 @@
-#' @param outdir Directory where output should be saved
-#' @param overwrite Overwrite existing files?
-read_gcp_modeling_results <- function (outdir = "/tmp", overwrite = FALSE) {
+load_doomics_shiny <- function (
+  an_asset = NULL,
+  outdir = "/tmp/doomics/data",
+  overwrite = FALSE
+) {
+  
+  # Download data and modeling results
   
   checkmate::assertCharacter(outdir, len = 1)
-  checkmate::assertDirectoryExists(outdir, access = "w")
   checkmate::assertLogical(overwrite, len = 1)
   
-  do_dir <- file.path(outdir, "domics")
-  if (!(dir.exists(do_dir))) {
-    dir.create(do_dir)
+  if (!(dir.exists(outdir))) {
+    dir.create(outdir, recursive = TRUE)
+  }
+  checkmate::assertDirectoryExists(outdir, access = "w")
+  
+  doomics_available_assets <- tibble::tribble(
+    ~ asset, ~ object, ~ public_url, ~ description,
+    "features_extended", "features_with_design.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/features_with_design.Rds", "Measurements of all features in all samples (including data modalities not discussed in manuscript - Olink, and peptide-level analysis)",
+    "features", "features_with_design_core.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/features_with_design_core.Rds", "Measurements of all features in all samples",
+    "signif", "model_signif.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/model_signif.Rds", "FDR-controlled terms for selected coefficients",
+    "tomic_extended", "tidy_features.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/tidy_features.Rds", "features, samples, and measurements list (including data modalities not discussed in manuscript - Olink, and peptide-level analysis)",
+    "tomic", "tidy_features_core.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/tidy_features_core.Rds", "features, samples, and measurements list",
+    "tomic_peptides", "tidy_features_peptides.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/tidy_features_peptides.Rds", "features, samples, and measurements list (for peptide-level measurements only)"
+  )
+  
+  available_assets_table <- function(doomics_available_assets) {
+    # internal function
+    doomics_available_assets %>%
+      dplyr::select(asset, description) %>%
+      mutate(description = stringr::str_wrap(description, 50)) %>%
+      knitr::kable() %>%
+      kableExtra::kable_styling() %>%
+      print()
   }
   
-  domic_files <- tibble::tribble(
-    ~ type, ~ object,
-    "tomic", "tidy_features.Rds",
-    "tomic_nopeptides", "tidy_features_no_peptides.Rds",
-    "tomic_peptides", "tidy_features_peptides.Rds",
-    "signif", "model_signif.Rds",
-    "features", "features_with_design.Rds"
-  ) %>%
-    dplyr::mutate(
-      local_path = file.path(do_dir, object),
-      exists = file.exists(local_path)
+  if (class(an_asset) == "NULL") {
+    available_assets_table(doomics_available_assets)
+    cli::cli_abort("You did not provide an input for {.var an_asset}. Please select a valid asset from {.val {paste(doomics_available_assets$asset, collapse = ', ')}}")
+  }
+  
+  checkmate::assertString(an_asset)
+  if (!(an_asset %in% doomics_available_assets$asset)) {
+    available_assets_table(doomics_available_assets)
+    cli::cli_abort("{.val {an_asset}} is not a valid value for {.var asset}. Please select a valid asset from {.val {paste(doomics_available_assets$asset, collapse = ', ')}}")
+  }
+  
+  # does the asset already exist?
+  asset_metadata <- doomics_available_assets %>% dplyr::filter(asset == an_asset)
+  stopifnot(nrow(asset_metadata) == 1)
+  
+  asset_local_path <- file.path(outdir, asset_metadata$object[1])
+  
+  return_functional <- function (asset_local_path) {
+    if (stringr::str_detect(asset_local_path, "\\.Rds$")) {
+      return(readRDS(asset_local_path))
+    } else {
+      return(asset_local_path)
+    }
+  }
+  
+  if (file.exists(asset_local_path) && !overwrite) {
+    return(return_functional(asset_local_path))
+  }
+  
+  # if the object is a file we can directly load it, otherwise download a
+  # set of files
+  
+  payload <- asset_metadata$public_url[[1]]
+  if (class(payload) == "character") {
+    utils::download.file(payload, destfile = asset_local_path)
+  } else if (class(payload) == "list") {
+    
+    if (!(dir.exists(asset_local_path))) {
+      dir.create(asset_local_path, recursive = TRUE)
+    }
+    
+    purrr::walk2(
+      names(payload),
+      unname(payload),
+      ~ utils::download.file(.y, file.path(asset_local_path, .x))
     )
-  
-  if (all(domic_files$exists) && !overwrite) {
-    return (domic_files %>% dplyr::select(type, object, local_path))
-  }
-  
-  # GCP service token is saved with the package
-  # <<TO DO - update auth>>
-  available_objects <- googleCloudStorageR::gcs_list_objects(prefix = "domics")
-  
-  domic_files <- domic_files %>%
-    dplyr::mutate(gcs_object_path = file.path("domics", object),
-                  gcs_exists = gcs_object_path %in% available_objects$name)
-  
-  unsatisfiable_requirments <- domic_files %>%
-    dplyr::filter(!exists & !gcs_exists)
-  if (nrow(unsatisfiable_requirments) != 0) {
-    stop (glue::glue(
-      "{nrow(unsatisfiable_requirments)} required objects were missing from GCS:
-      {paste(unsatisfiable_requirments$gcs_object_path, collapse = ', ')}"
-    ))
-  }
-  
-  if (overwrite) {
-    assets_to_get <- domic_files
   } else {
-    assets_to_get <- domic_files %>%
-      dplyr::filter(!exists)
+    cli::cli_abort("public_url is a {.val {class(payload)[1]}} and must be a character or list")
   }
   
-  for (i in 1:nrow(assets_to_get)) {
-    googleCloudStorageR::gcs_get_object(
-      object = assets_to_get$gcs_object_path[i],
-      saveToDisk = assets_to_get$local_path[i],
-      overwrite = overwrite
-    )
-  }
-  
-  return (domic_files %>% dplyr::select(type, object, local_path))
+  return(return_functional(asset_local_path))
 }
 
 stratify_by <- tibble::tribble(

@@ -31,7 +31,7 @@ params <- setup_figure_params()
 
 ```{r power_simulation, cache = TRUE}
 n_mice <- 110
-n_simulations <- 1000
+n_simulations <- 50 # manuscript simulated at 1000
 target_alpha = 0.05
 
 # define effect sizes and noise
@@ -78,7 +78,6 @@ parameter_grid$power_age_x_longevity <- purrr::map_dbl(1:nrow(parameter_grid), f
   sum(replicate(n_simulations, fit_lm(x_design, expectation_y, noise)) < target_alpha)/n_simulations
   })
 
-
 ```
 
 ```{r power_plots, dependson="power_simulation", fig.height = 11, fig.width = 12}
@@ -113,11 +112,10 @@ effect_size_by_sd_plot <- ggplot(data = renamed_parameter_grid, aes(x = beta, y 
 
 create_and_upload_figure(
   name = "power_analysis",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 12,
   height = 11,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".pdf", ".png")
 )
 

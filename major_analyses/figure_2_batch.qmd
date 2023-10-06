@@ -31,11 +31,8 @@ source("manuscript_prep_utils.R")
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-features_with_design <- load_domics("features", domics_paths)
+features_with_design <- load_doomics("features", params$cache_dir)
 ```
 
 ## Random metabolite examples
@@ -133,11 +130,10 @@ lbd_plot <- like_a_middle_aged_g11_aug %>%
 lbd_plot
 create_and_upload_figure(
   name = "lbd_plot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 6,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".pdf", ".png")
 )
 ```
@@ -212,11 +208,10 @@ eg8_plot <- like_a_g8_aug %>%
 eg8_plot
 create_and_upload_figure(
   name = "eg8_plot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 6,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".pdf", ".png")
 )
 ```

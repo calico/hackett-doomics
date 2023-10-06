@@ -27,19 +27,13 @@ source("manuscript_prep_utils.R")
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(
-  outdir = file.path(params$cache_dir, "data"),
-  overwrite = FALSE
-  )
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-feature_design_list <- load_domics("feature_design_list", domics_paths)
-features_with_design <- load_domics("features", domics_paths)
+tidy_omics <- load_doomics("tomic", params$cache_dir)
+feature_design_list <- load_doomics("feature_design_list", params$cache_dir)
+features_with_design <- load_doomics("features", params$cache_dir)
 
 # models fits for just selected coefficients
-feature_signif <- load_domics("signif", domics_paths) %>%
+feature_signif <- load_doomics("signif", params$cache_dir) %>%
   filter(
     data_modality %in% c("lipidomics", "metabolomics", "proteomics")
     ) %>%
@@ -47,7 +41,7 @@ feature_signif <- load_domics("signif", domics_paths) %>%
   mutate(term = ifelse(term == "fraction of life lived x sex", "fraction of life lived x male", term))
   
 # all models fit
-all_model_signif <- load_domics("all_model_signif", domics_paths) %>%
+all_model_signif <- load_doomics("all_model_signif", params$cache_dir) %>%
   dplyr::filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
 
 # summaries of features and samples
@@ -56,11 +50,18 @@ features <- romic::get_tomic_table(tidy_omics, "features") %>%
   filter(data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
 samples <- romic::get_tomic_table(tidy_omics, "samples")
 
+# Download mouse gene sets from http://www.gsea-msigdb.org/gsea/downloads.jsp
+gene_set_path <- load_doomics("gene_sets", params$cache_dir)
+gmts_used <- c(
+  "m2.cp.reactome.v2022.1.Mm.entrez.gmt",
+  "m5.go.bp.v2022.1.Mm.entrez.gmt"
+)
+
 # script-specific imports and configuration
 library(patchwork) # for combining grobs
 library(ggtext) # for markdown in grobs
 # load the shiny app's feature-level plotting functions
-source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+source(file.path(params$repo_path, "bioinformatics", "3_interactive", "results_browser", "interactive.R"))
 
 # overwrite cached results
 overwrite = FALSE
@@ -108,11 +109,10 @@ combined_pvalue_histograms <- feature_signif %>%
 combined_pvalue_histograms
 create_and_upload_figure(
   name = "combined_pvalue_histograms",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 5,
   height = 15,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -159,11 +159,10 @@ data_modality_specific_pvalue_histograms <- feature_signif %>%
 data_modality_specific_pvalue_histograms
 create_and_upload_figure(
   name = "data_modality_specific_pvalue_histograms",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 8,
   height = 15,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -192,11 +191,10 @@ term_signif_barplot <- feature_signif %>%
 term_signif_barplot
 create_and_upload_figure(
   name = "term_signif_barplot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3",
   width = 7,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -271,11 +269,10 @@ meaure_corrs_patchwork_grob <- lifespan_remaining_vs_fll_grob + lifespan_vs_fll_
 meaure_corrs_patchwork_grob
 create_and_upload_figure(
   name = "meaure_corrs_patchwork_grob",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 13,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png")
 )
 ```
@@ -429,11 +426,10 @@ combined_example_features <- sex_ex + ddm_ex + aging_ex + lifespan_ex + age_x_li
 combined_example_features
 create_and_upload_figure(
   name = "combined_example_features",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3",
   width = 12,
   height = 15,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png")
 )
 ```
@@ -537,11 +533,10 @@ alt_term_signif_barplot <- ggplot(
 alt_term_signif_barplot
 create_and_upload_figure(
   name = "alt_term_signif_barplot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 6,
   height = 7,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
   )
 ```
@@ -588,13 +583,6 @@ feature_design_list$proteomics_features %>%
 #### Organize Proteins for Enrichment
 
 ```{r protein_go}
-# Download mouse gene sets from http://www.gsea-msigdb.org/gsea/downloads.jsp
-gene_set_path <- "/scratch3/sean/msigdb_v2022.1.Mm_files_to_download_locally/msigdb_v2022.1.Mm_GMTs"
-gmts_used <- c(
-  "m2.cp.reactome.v2022.1.Mm.entrez.gmt",
-  "m5.go.bp.v2022.1.Mm.entrez.gmt"
-)
-
 # map from uniprot to entrez
 gmts_list <- file.path(gene_set_path, gmts_used) %>%
   purrr::map(fgsea::gmtPathways)
@@ -952,11 +940,10 @@ fxnl_enrichments_beeswarm <- fxnl_enrichments_beeswarm_not_by_day +
 fxnl_enrichments_beeswarm
 create_and_upload_figure(
   name = "fxnl_enrichments_beeswarm",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3",
   width = 11,
   height = 9,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -1008,11 +995,10 @@ alt_terms_beeswarm <- alt_terms_beeswarm_by_day +
 alt_terms_beeswarm
 create_and_upload_figure(
   name = "fxnl_enrichments_alt_beeswarm",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure3/Supp",
   width = 11,
   height = 9,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```

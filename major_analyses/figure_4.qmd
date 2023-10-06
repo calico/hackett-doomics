@@ -14,11 +14,11 @@ format:
     code-block-border-left: "#5BB867"
 ---
 
-The Figure 3 section identifies the union of aging and longevity-associated pathways that we may be interested in but many pathways show up in multiple aging regressions. This section will delve into which pathways are associated with particular modes of aging (e.g., chronological aging versus fraction of life lived).
+The Figure 3 section identifies the union of aging and longevity-associated pathways that we may be interested in but many pathways show up in multiple aging regressions. This section will delve into which pathways are associated with particular archetypes of aging (e.g., chronological aging versus fraction of life lived).
 
 This is done using head-to-head model comparisons using AIC. The goal of this to determine which aging regression model best fits each pathway (accounting for relative degrees of freedom) by aggregating per-feature model summaries.
 
-After assigning pathways to specific modes of aging we can select some of the strongest and/or most interesting features associated with each pathway to add context to univariate volcano plots, and bivariate signed-significance plots.
+After assigning pathways to specific aging archetypes we can select some of the strongest and/or most interesting features associated with each pathway to add context to subsequent analyses.
 
 Outputs:
 
@@ -26,7 +26,7 @@ Outputs:
     - longevity_features_to_top_pathway: features associated with aging/longevity assigned to a specific GO category and mode of aging
     - top_longevity_hits_in_pathways: top hits in each pathway for downstream visualization 
     - top_pathways_for_term_affinity: pathways and their members including non-pathway-associated proteins, metabolites, and lipids as separate categories.
-    - term_affinity_summaries: pathways assigned to specific aging modes
+    - term_affinity_summaries: pathways assigned to specific aging archetypes
 
 
 ```{r setup, include=FALSE}
@@ -42,18 +42,15 @@ source("manuscript_prep_utils.R")
 # setup global parameters and redentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-domics_signif <- load_domics("signif", domics_paths) %>%
+tidy_omics <- load_doomics("tomic", params$cache_dir)
+domics_signif <- load_doomics("signif",  params$cache_dir) %>%
   filter(data_modality %in% c("metabolomics", "proteomics", "lipidomics"))
-feature_design_list <- load_domics("feature_design_list", domics_paths)
-features_with_design <- load_domics("features", domics_paths)
+feature_design_list <- load_doomics("feature_design_list",  params$cache_dir)
+features_with_design <- load_doomics("features",  params$cache_dir)
 
 # raw model fits
-signif_all_models <- load_domics("signif_all_models", domics_paths)
+signif_all_models <- load_doomics("signif_all_models", params$cache_dir)
 model_summaries <- signif_all_models %>%
   dplyr::select(-params, -fits) %>%
   tidyr::unnest(model_summary) %>%
@@ -71,10 +68,9 @@ samples <- romic::get_tomic_table(tidy_omics, "samples")
 # script-specific setup
 # load gsea results from  and cleaned up metadata from figure_3.Rmd
 figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
-feature_signif <- figure_3_out$feature_signif_aug
 
 library(patchwork) # for combining grobs
-source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+source(file.path(params$repo_path, "bioinformatics", "3_interactive", "results_browser", "interactive.R"))
 
 overwrite = FALSE
 ```
@@ -164,11 +160,10 @@ crossed_signif_plot <- crossed_signif_compare %>%
 crossed_signif_plot
 create_and_upload_figure(
   name = "crossed_significance",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4/Supp",
   width = 11,
   height = 9,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -206,11 +201,10 @@ crossed_signif_plot2 <- crossed_signif_compare %>%
 crossed_signif_plot2
 create_and_upload_figure(
   name = "crossed_significance_subset",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4",
   width = 8,
   height = 8,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 
@@ -519,11 +513,10 @@ term_affinities_grob <- term_affinity_summaries %>%
 term_affinities_grob
 create_and_upload_figure(
   name = "term_affinities_grob",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4/Supp",
   width = 10,
   height = 8,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -586,11 +579,10 @@ pw_rollup_just_pcsk9 + pw_rollup +
 
 create_and_upload_figure(
   name = "pw_rollup_igf",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4/Supp",
   width = 16,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -909,11 +901,10 @@ ternary_grob <- ternary_data %>%
 ternary_grob
 create_and_upload_figure(
   name = "ternary_grob",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4",
   width = 15,
   height = 7,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -951,9 +942,9 @@ distinctive_aging_features <- top_longevity_hits_in_pathways %>%
   
 feature_subset <- distinctive_aging_features$feature_label
 
-aging_ex <- plot_aging(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$aging + theme(legend.position = "none") + labs(title = NULL) + theme(legend.position = "none")
-age_x_lifespan_ex <- plot_age_by_lifespan(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$age_by_lifespan + labs(title = NULL) + theme(legend.position = "none")
-fll_ex <- plot_fraction_of_life_lived(features_with_design, feature_signif, feature_names = feature_subset, facet_ncol = 6)$plots$fraction_of_life_lived + labs(title = NULL)
+aging_ex <- plot_aging(features_with_design, domics_signif, feature_names = feature_subset, facet_ncol = 6)$plots$aging + theme(legend.position = "none") + labs(title = NULL) + theme(legend.position = "none")
+age_x_lifespan_ex <- plot_age_by_lifespan(features_with_design, domics_signif, feature_names = feature_subset, facet_ncol = 6)$plots$age_by_lifespan + labs(title = NULL) + theme(legend.position = "none")
+fll_ex <- plot_fraction_of_life_lived(features_with_design, domics_signif, feature_names = feature_subset, facet_ncol = 6)$plots$fraction_of_life_lived + labs(title = NULL)
 
 x <- age_x_lifespan_ex / aging_ex / fll_ex  &
   guides(color=guide_legend(override.aes = list(size=5)))
@@ -963,11 +954,10 @@ x +
 
 create_and_upload_figure(
   name = "distinctive_aging_features",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure4/Supp",
   width = 18,
   height = 10,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```

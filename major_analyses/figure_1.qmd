@@ -22,27 +22,20 @@ knitr::opts_chunk$set(echo = TRUE)
 suppressPackageStartupMessages(library(tidyverse))
 
 # load functions for data download and figure upload
+if (basename(getwd()) != "major_analyses") {
+  stop(
+  "Please run this code from the major_analyses directory; this should be the
+  default if you are rendering a .qmd")
+}
+
 source("manuscript_prep_utils.R")
 
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-
-# other figure-specific configuration
-
-# drive ID for manuscript figures and other assets
-manuscript_drive_root <- googledrive::as_id(params$manuscript_drive_root)
-
-# load SHOCK results from Drive
-# its unclear whether and how much of this data we can release so
-# we need to make it very explicit when we load these results
-source(file.path(params$repo_path, "utils", "data_prep.R"))
-mouse_phenotypes <- load_mouse_phenotypes(shock_token = params$shock_token)
+tidy_omics <- load_doomics("tomic", params$cache_dir)
+mouse_phenotypes <- load_doomics("mouse_phenotypes", params$cache_dir)$mouse_phenotypes_reduced
 ```
 
 # Figure 1
@@ -100,7 +93,6 @@ mouse_median_lifespans <- bind_rows(
 ) %>%
   mutate(plot_type = "header")
 
-
 lifespan_distribution <- ggplot(annotated_shock_mice %>% mutate(plot_type = "hist"), aes(x = lifespan)) +
   geom_histogram(binwidth = 20, aes(fill = this_study)) +
   geom_vline(aes(plot_type ="hist"), xintercept = c(365 * 8/12, 365 * 14/12, 365 * 20/12)-20, linetype="dotted") +
@@ -120,11 +112,10 @@ lifespan_distribution <- ggplot(annotated_shock_mice %>% mutate(plot_type = "his
 lifespan_distribution
 create_and_upload_figure(
   name = "lifespan_distribution",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure1",
   width = 8,
   height = 5,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -136,44 +127,25 @@ create_and_upload_figure(
 Injection comparison plots were created in featurization_small_molecules.Rmd for all datasets with multiple replicates. There are four such datasets, positive and negative mode metabolomics and lipidomics for set12 (while no technical replicates were used in set3).
 
 ```{r injection_comparison}
-path_do_config <- file.path(params$repo_path, "do_config.json")
-path_out_base_dir <- file.path(load_domics("informatics", domics_paths), "metabolites_lipids")
-featurization_parameters <- suppressMessages(featurization_parameterization(path_do_config, path_out_base_dir))
-
 # copy all of the relevant plots to a common location so the .pngs can be merged in Adobe InDesign
-
-injection_plots_df <- featurization_parameters %>%
-  filter(set == "1/2", data_type %in% c("metabolites-neg", "metabolites-pos")) %>%
-  mutate(
-    plot_path = file.path(dataset_path, "out_figures", "injection_comparison-1.png"),
-    exists = file.exists(plot_path),
-    updated_name = glue::glue("{data_type}_injection_comparison.png"),
-    updated_path = file.path(params$figures_dir, updated_name)
-    ) 
-
-# move and rename figures
-purrr::walk2(
-  injection_plots_df$plot_path,
-  injection_plots_df$updated_path,
-  file.copy
-)
-
-purrr::walk(
-  injection_plots_df$updated_path,
-  calibase::upload_to_drive,
-  drive_path = "Plots/injection_comparison",
-  drive_root = manuscript_drive_root
-)
+if (params$update_figures) {
+  select_informatics_plots_path <- load_doomics("select_informatics_plots", params$cache_dir)
+  
+  purrr::walk(
+    file.path(select_informatics_plots_path, list.files(select_informatics_plots_path, pattern = "injection")),
+    calibase::upload_to_drive,
+    drive_path = "Plots/injection_comparison",
+    drive_root = params$manuscript_drive_root
+  )
+}
 ```
 
 ## Compare All Normalization Methods
 
 ```{r sample_v_posctl_rmse, fig.height = 6, fig.width = 6}
-all_normalized_peaks <- featurization_parameters %>%
-  mutate(
-    peaks_path = file.path(dataset_path, "out_files", "normalized_small_molecules.Rds"),
-    peaks_dat = purrr::map(peaks_path, readRDS)
-    ) %>%
+normalized_peaks <- load_doomics("normalized_peaks")
+
+all_normalized_peaks <- normalized_peaks %>%
   mutate(
     posctrl_measurements = purrr::map(
       peaks_dat,
@@ -270,11 +242,10 @@ normalization_choice_plot <- rmse_by_partition %>%
 normalization_choice_plot
 create_and_upload_figure(
   name = "sample_v_posctrl_rmse",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure1/Supp",
   width = 7,
   height = 7,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 
@@ -285,14 +256,17 @@ create_and_upload_figure(
 These plots were already generated in featurization_proteomics_compms.Rmd so we can just copy them as-is.
 
 ```{r proteomics_plots}
-proteomics_informatics_plot_path <- file.path(load_domics("informatics", domics_paths), "proteomics", "out_figures")
-
-select_proteomics_plots <- c("batch_post_correction-1.png", "tmt_ra_correlations-1.png", "tmt_bridge_correlations-1.png")
-
-file.path(proteomics_informatics_plot_path, select_proteomics_plots) %>%
+if (params$update_figures) {
+  select_informatics_plots_path <- load_doomics("select_informatics_plots", params$cache_dir)
+  
+  select_proteomics_plots <- c("batch_post_correction-1.png", "tmt_ra_correlations-1.png", "tmt_bridge_correlations-1.png")
+  
   purrr::walk(
-  calibase::upload_to_drive,
-  drive_path = "Plots/proteomics_informatics",
-  drive_root = manuscript_drive_root
-)
+    file.path(select_informatics_plots_path, select_proteomics_plots),
+    calibase::upload_to_drive,
+    drive_path = "Plots/proteomics_informatics",
+    drive_root = params$manuscript_drive_root
+  )
+}
+
 ```

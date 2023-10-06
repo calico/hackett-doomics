@@ -27,12 +27,9 @@ source("manuscript_prep_utils.R")
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-feature_design_list <- load_domics("feature_design_list", domics_paths)
+tidy_omics <- load_doomics("tomic", params$cache_dir)
+feature_design_list <- load_doomics("feature_design_list", params$cache_dir)
 ```
 
 ## Principal Component Plots
@@ -103,11 +100,10 @@ pc_plot <- romic::plot_bivariate(
 pc_plot
 create_and_upload_figure(
   name = "pcplot_corrected",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2",
   width = 9,
   height = 7.5,
-  tmp_figure_dir = params$figures_dir,
   extensions = ".png" # pdf doesn't work with mars/venus symbols
 )
 ```
@@ -132,11 +128,10 @@ pc_plot_fll <- romic::plot_bivariate(
 pc_plot_fll
 create_and_upload_figure(
   name = "pc_plot_fll",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 7,
   height = 6,
-  tmp_figure_dir = params$figures_dir,
   extensions = ".png" # pdf doesn't work with mars/venus symbols
 )
 ```
@@ -175,11 +170,10 @@ pc_plot_w_batcheffects <- samples_w_pcs_w_batcheffects %>%
 pc_plot_w_batcheffects
 create_and_upload_figure(
   name = "pcplot_w_batcheffects",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 10,
   height = 8,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -235,11 +229,10 @@ pc_plot_by_batch_and_datamodality <- data_type_pcs %>%
 pc_plot_by_batch_and_datamodality
 create_and_upload_figure(
   name = "pc_plot_by_batch_and_datamodality",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 8,
   height = 8,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -283,11 +276,10 @@ screeplot <- tibble(
 screeplot
 create_and_upload_figure(
   name = "screeplot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 4,
   height = 4,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -331,11 +323,10 @@ mahalanobis_dists_plot <- ggplot(data = pc_distances, aes(x = pc_distance, fill 
 mahalanobis_dists_plot
 create_and_upload_figure(
   name = "mahalanobis_dists_plot",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 6,
   height = 3.5,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -374,11 +365,10 @@ corrected_heatmap <- romic::update_tomic(
 corrected_heatmap
 create_and_upload_figure(
   name = "corrected_heatmap",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2",
   width = 7,
   height = 12,
-  tmp_figure_dir = params$figures_dir,
   extensions = ".png"
 )
 
@@ -406,11 +396,10 @@ corrected_heatmap_fll <- romic::update_tomic(
 corrected_heatmap_fll
 create_and_upload_figure(
   name = "corrected_heatmap_fll",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 7,
   height = 12,
-  tmp_figure_dir = params$figures_dir,
   extensions = ".png"
 )
 
@@ -434,11 +423,10 @@ heatmap_w_batcheffects <- tidy_omics_coredata %>%
 heatmap_w_batcheffects
 create_and_upload_figure(
   name = "heatmap_w_batcheffects",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure2/Supp",
   width = 10,
   height = 12,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```

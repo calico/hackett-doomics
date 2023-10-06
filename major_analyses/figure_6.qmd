@@ -36,24 +36,23 @@ source("manuscript_prep_utils.R")
 
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-features_with_design <- load_domics("features", domics_paths) %>%
+features_with_design <- load_doomics("features", params$cache_dir) %>%
   filter(!is_ddm_sample, data_modality %in% c("metabolomics", "lipidomics", "proteomics"))
 
-tidy_omics <- load_domics("tomic", domics_paths) %>%
+tidy_omics <- load_doomics("tomic", params$cache_dir) %>%
   romic::filter_tomic("category", "features", c("proteomics", "metabolomics", "lipidomics"), "data_modality")
 
 # pull out and augment features and samples
-feature_design_list <- load_domics("feature_design_list", domics_paths)
+feature_design_list <- load_doomics("feature_design_list", params$cache_dir)
 features <- romic::get_tomic_table(tidy_omics, "features") %>%
   add_feature_label(feature_design_list)
 samples <- romic::get_tomic_table(tidy_omics, "samples")
 
-domics_signif <- load_domics("signif", domics_paths) %>%
+domics_signif <- load_doomics("signif", params$cache_dir) %>%
   semi_join(features, by = "feature_name")
+
+proteomics_features_annotated <- load_doomics("protein_annotations", params$cache_dir)
 
 # load Cached lifespan-associated features and cleaned up metadata from figure_3.Rmd
 figure_3_out <- readRDS(file = file.path(params$cache_dir, "figure_3_out.RDS"))
@@ -83,7 +82,7 @@ lifespan_hits_features_with_design <- figure_5_out$lifespan_hits_data %>%
 library(patchwork)
 
 # load the shiny app's feature-level plotting functions
-source(file.path(params$repo_path, "3_interactive/results_browser/interactive.R"))
+source(file.path(params$repo_path, "bioinformatics", "3_interactive", "results_browser", "interactive.R"))
 ```
 
 ## Group Pathways
@@ -119,26 +118,6 @@ proteomics_features <- bind_rows(
       category_label = "Other Proteomics [top 20]",
       category_general_label = "Other Proteomics [top 20]"
       )
-)
-```
-
-## Manual Curation of Proteins
-
-```{r}
-calibase::configure_google_access()
-
-gsheet_id <- googlesheets4::as_sheets_id("1KeQ69iG0tTM58OYGQHgrN70CJ3i-FP9duqOnWpw4x38")
-
-#proteomics_features %>%
-#  select(feature_name, feature_label, go_aging_archetype, category_label, all_category_label, category_general_label, all_category_general_label, feature_aging_archetype, change_w_age, q.value) %>%
-#  googlesheets4::write_sheet(
-#  gsheet_id,
-#  "raw_associations"
-#)
-
-proteomics_features_annotated <- googlesheets4::read_sheet(
-  gsheet_id,
-  sheet = "associations_v2"
 )
 ```
 
@@ -244,11 +223,10 @@ aging_metabolomics_supp_grob <- aging_known_metabolites_grob +
 aging_metabolomics_supp_grob
 create_and_upload_figure(
   name = "aging_metabolomics_supp",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 16,
   height = 26,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -266,11 +244,10 @@ taurocholic_acid_grob <- plot_fraction_of_life_lived(features_with_design, domic
 taurocholic_acid_grob
 create_and_upload_figure(
   name = "taurocholic_acid",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 10,
   height = 7,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -310,11 +287,10 @@ main_text_metabolites_and_lipids_grob <- (aging_core_metabolites_grob + theme(le
 main_text_metabolites_and_lipids_grob
 create_and_upload_figure(
   name = "main_text_metabolites_and_lipids",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6",
   width = 25,
   height = 12,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -335,11 +311,10 @@ lipid_chronage_grob <- visualize_feature_subsets(
 lipid_chronage_grob
 create_and_upload_figure(
   name = "lipid_chronage",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 24,
   height = 20,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -362,11 +337,10 @@ curated_proteins_grob <- visualize_feature_subsets(
 curated_proteins_grob
 create_and_upload_figure(
   name = "curated_proteins",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Extras",
   width = 36,
   height = 30,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -387,11 +361,10 @@ ecm_grob <- visualize_feature_subsets(
 ecm_grob
 create_and_upload_figure(
   name = "ecm",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 16,
   height = 13,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -425,11 +398,10 @@ innate_immunity_grob <- visualize_feature_subsets(
 innate_immunity_grob
 create_and_upload_figure(
   name = "innate_immunity",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 16,
   height = 13,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -473,11 +445,10 @@ lbp_immune_grob <- ggplot(lbp_immune_scatter_data, aes(y = corrected_log2_abunda
 lbp_immune_grob
 create_and_upload_figure(
   name = "lbp_immune",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 6,
   height = 4,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -503,11 +474,10 @@ proteostasis_grob <- visualize_feature_subsets(
 proteostasis_grob
 create_and_upload_figure(
   name = "proteostasis",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 16,
   height = 13,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -538,11 +508,10 @@ homeostasis_grob <- visualize_feature_subsets(
 homeostasis_grob
 create_and_upload_figure(
   name = "homeostasis",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure6/Supp",
   width = 16,
   height = 13,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```

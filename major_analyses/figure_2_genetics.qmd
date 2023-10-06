@@ -1,0 +1,436 @@
+---
+title: "QTL Hotspots"
+author: "Shackett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    theme: minty
+    highlight: tango
+    code-block-bg: true
+    code-block-border-left: "#5BB867"
+---
+
+The purpose of this notebook is to:
+
+1. Create a procedure for correcting for multiple testing across molecular features. The result of this is that there no evidence for QTLs which impact how molecules change with age, but ~250 QTLs affecting metabolite/protein/lipid abundance can be found at an FDR of 10%.
+2. Identify QTLs with large effects which may cascade across multiple molecules manifesting as hotspots where many features are linked to the same regions of the genomes. There are evidence for two QTL hotspots affecting abundance, one on chromosome 6 and one on chromosome 12. Most of the features mapping to these regions are immune-related, and spot-checking a few associations, they seemed to map to chromosome 6/12. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r env_setup}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(qtl2))
+suppressPackageStartupMessages(library(org.Mm.eg.db))
+library(patchwork)
+
+# load functions for data download and figure upload
+source("manuscript_prep_utils.R")
+
+# setup global parameters and credentials
+params <- setup_figure_params()
+
+# load specific files
+features_with_design <- load_doomics("features", params$cache_dir)
+qtl_data <- load_doomics("qtl_data", params$cache_dir)
+pmap <- load_doomics("genetic_map", params$cache_dir)
+
+overwrite <- FALSE
+```
+
+
+## Summarize Metabolites and Estimating Heritability
+
+```{r heritability, fig.width = 15, fig.height = 6}
+# estimate broad sense heritability based on consistency of measurements by mouse
+
+heritability_setup <- features_with_design %>%
+  filter(data_modality %in% c("proteomics", "metabolomics", "lipidomics")) %>%
+  dplyr::filter(!is.na(corrected_log2_abundance)) %>%
+  dplyr::group_by(feature_name, Sex) %>%
+  dplyr::mutate(sex_mean = mean(corrected_log2_abundance)) %>%
+  dplyr::group_by(feature_name, Mouse.ID) %>%
+  # remove cases where a mouse only has 1 measurement
+  dplyr::filter(n() > 1) %>%
+  dplyr::mutate(mouse_mean = mean(corrected_log2_abundance)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    sex_resid = corrected_log2_abundance - sex_mean,
+    mouse_resid = corrected_log2_abundance - mouse_mean
+    )
+
+sex_tss <- heritability_setup %>%
+  dplyr::group_by(data_modality, feature_name, Sex) %>%
+  # adjust for loss of d.o.f by subtracting mean
+  dplyr::summarize(
+    # same as below
+    #sex_tss = sum(sex_resid^2)*(n() / (n() - 1))
+    sex_tss = var(sex_resid)*n(),
+    .groups = "drop"
+    ) %>%
+  dplyr::group_by(data_modality, feature_name) %>%
+  dplyr::summarize(sex_tss = sum(sex_tss), .groups = "drop")
+
+mouse_tss <- heritability_setup %>%
+  dplyr::group_by(data_modality, feature_name, Mouse.ID) %>%
+  # adjust for loss of d.o.f by subtracting mean
+  dplyr::summarize(mouse_tss = var(mouse_resid)*n(), .groups = "drop") %>%
+  dplyr::group_by(data_modality, feature_name) %>%
+  dplyr::summarize(mouse_tss = sum(mouse_tss), .groups = "drop")
+
+heritability <- dplyr::left_join(sex_tss, mouse_tss, by = c("data_modality", "feature_name")) %>%
+  dplyr::mutate(
+    broad_sense_heritability = (sex_tss - mouse_tss)/sex_tss,
+    broad_sense_heritability = pmax(broad_sense_heritability, 0)
+    ) %>%
+  dplyr::arrange(desc(broad_sense_heritability))
+
+top_heritability <- heritability %>%
+  mutate(feature_label = dplyr::case_when(
+    data_modality == "proteomics" ~ stringr::str_extract(feature_name, "^[A-Za-z0-9]+"),
+    TRUE ~ feature_name
+    )) %>%
+  # drop genes w/o ensembl names as heritability examples
+  filter(feature_label != "sp") %>%
+  dplyr::mutate(facet_label = glue::glue("H2 = {round(broad_sense_heritability, 2)}; {feature_label}")) %>%
+  group_by(data_modality) %>%
+  dplyr::slice(1:3) %>%
+  arrange(desc(data_modality), desc(broad_sense_heritability)) %>%
+  mutate(facet_label = factor(facet_label, levels= facet_label))
+
+high_herit_examples <- features_with_design %>%
+  dplyr::inner_join(top_heritability, by = c("feature_name", "data_modality"))
+
+# add ranks to make a waterfall plot
+high_herit_examples <- high_herit_examples %>%
+  dplyr::left_join(
+    high_herit_examples %>%
+      dplyr::group_by(data_type, feature_name, Mouse.ID) %>%
+      dplyr::summarize(mouse_average = mean(corrected_log2_abundance), .groups = "drop") %>%
+      dplyr::group_by(data_type, feature_name) %>%
+      dplyr::arrange(desc(mouse_average)) %>%
+      dplyr::mutate(mouse_rank = 1:n()),
+    by = c("data_type", "feature_name", "Mouse.ID")
+  )
+
+high_herit_examples_plot <- high_herit_examples %>%
+  mutate(feature_label = dplyr::case_when(
+    data_modality == "proteomics" ~ stringr::str_extract(feature_name, "^[A-Za-z0-9]+"),
+    TRUE ~ feature_name
+    )) %>%
+  ggplot(aes(x = mouse_rank, y = corrected_log2_abundance)) +
+  geom_point(color = "gray30") +
+  facet_wrap(~ facet_label, ncol = 3, scale = "free_y") +
+  scale_x_continuous("Mice ordered by average abundance") +
+  scale_y_continuous(expression(log[2] ~ "relative abundance")) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), panel.grid.minor = element_blank())
+  
+heritability_histogram <- ggplot(heritability, aes(x = broad_sense_heritability)) +
+  geom_histogram(bins = 30, fill = "gray30") +
+  coord_cartesian(xlim = c(0,1)) +
+  scale_x_continuous(expression("Broad sense heritability," ~ H^2)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+heritability_patchwork <- (heritability_histogram + high_herit_examples_plot) +
+  plot_layout(widths = c(1, 2)) +
+  plot_annotation(tag_levels = 'A')
+
+heritability_patchwork
+create_and_upload_figure(
+  name = "heritability",
+  params = params,
+  drive_path = "Figures/Figure2/Supp",
+  width = 15,
+  height = 6,
+  extensions = c(".pdf", ".png")
+)
+```
+
+## GM2/GM3 Inborn Error
+
+3 female mice are nod/nod for the loss of function variant
+
+```{r}
+gm2_gm3 <- heritability %>%
+  filter(stringr::str_detect(feature_name, "GM[23]\\("))
+
+gm2_gm3_plot <- features_with_design %>%
+  semi_join(gm2_gm3, by = c("data_modality", "feature_name")) %>%
+  group_by(feature_name, Mouse.ID, Sex) %>%
+  summarize(
+    mouse_average_abundance = mean(corrected_log2_abundance),
+    .groups = "drop"
+    ) %>%
+  ungroup() %>%
+  mutate(genotype = case_when(
+    # only two of these were actually genotyped, and a plot based
+    # on the actual genotypes is in the manuscript
+    Mouse.ID %in% c("DO.0129", "DO.0513", "DO.0500") ~ "nod/nod",
+    TRUE ~ "+/+, nod/+"
+    ),
+    genotype = factor(genotype, levels = c("+/+, nod/+", "nod/nod"))
+  ) %>%
+  ggplot(aes(x = genotype, y = mouse_average_abundance)) +
+  ggbeeswarm::geom_beeswarm(cex = 2, color = "gray30") +
+  facet_wrap(~ feature_name, nrow = 1) +
+  scale_y_continuous(expression("Average" ~ log[2] ~ "abundance by mouse")) +
+  scale_x_discrete("Genotype") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+gm2_gm3_plot
+create_and_upload_figure(
+  name = "gm2_gm3_plot",
+  params = params,
+  drive_path = "Figures/Figure2/Supp",
+  width = 7,
+  height = 4,
+  extensions = c(".pdf", ".png")
+)
+```
+
+## QTL Analysis
+
+```{r fxns}
+find_peak_signif <- function (q_thresh, snp_scan_data, pmap, permute_scan) {
+  
+  lod_permute_cutoff <- round(quantile(permute_scan, q_thresh), 3)
+  
+  sig_loci <- find_peaks(snp_scan_data, map = pmap, threshold = lod_permute_cutoff, drop=lod_permute_cutoff*0.2)
+  n_perms = nrow(permute_scan)
+  
+  if (nrow(sig_loci) == 0) {
+    pval <- 1 - sum(maxlod(snp_scan_data) > permute_scan) / n_perms
+  } else {
+    pval <- 1 - sum(min(sig_loci$lod) > permute_scan) / n_perms
+  }
+  
+  return(list(
+    pvalue = pval,
+    sig_loci = sig_loci
+  ))
+}
+
+call_qtls <- function(snp_scan_data, permute_scan, pmap) {
+  
+  out <- tibble::tibble(q_thresholds = seq(0.9, 0.99, by = 0.01)) %>%
+    dplyr::mutate(peak_data = purrr::map(q_thresholds, find_peak_signif, snp_scan_data, pmap, permute_scan)) %>%
+    tidyr::unnest_wider(peak_data)
+
+  return(out)
+}
+```
+
+```{r body}
+# compare max(lod) of observed and null values to determine which primary
+# QTLs are significant. This will yield the most features with some associations
+# but would ignore multiple strong(ish) QTLs for the same feature.
+# To get around this, set secondary QTL thresholds on [0.9, 0.99]
+# for a threshold t, set the max observed lod score at the max if t > max(lod)
+# and if t < max(lod) use the min >t peak as a p-value. Doing this retain all loci > t.
+# calculate qvalues based on max(lod). accept a cutoff t as valid if qvalue(t) < 0.1
+# i.e., at the p-value cutoff where all extreme peaks are accepted, the FDR is controlled.
+# Select the min(t) on [0.9, 0.99] where the target FDR is realized
+
+qtl_results_cache_path <- file.path(params$cache_dir, "qtl_results.Rds")
+
+if (!file.exists(qtl_results_cache_path) || overwrite) {
+  
+  qtl_results <- qtl_data %>%
+    dplyr::mutate(trait_results = purrr::map2(snp_scan_data, permute_scan, call_qtls, pmap))
+  
+  saveRDS(qtl_results, qtl_results_cache_path) 
+} else {
+  qtl_results <- readRDS(qtl_results_cache_path)
+}
+
+qtl_results <- qtl_results %>%
+  dplyr::select(-snp_scan_data, -permute_scan) %>%
+  mutate(trait_results = purrr::map(
+    trait_results,
+    function(x) {
+      # separately unnest by class - this is kind of dumb
+      # but unnesting together doesn't work due to some entries being
+      # tables and others being lists of tables
+      if (class(x$sig_loci) == "list") {
+        x %>% unnest(sig_loci)
+      } else if (class(x$sig_loci) == "data.frame") {
+        x %>% unnest(sig_loci)
+      } else {
+        x
+      }
+    }
+  )) %>% unnest(trait_results)
+```
+
+```{r pval_dist, fig.height = 8, fig.width = 8}
+qtl_results %>%
+  dplyr::filter(q_thresholds == 0.99) %>%
+  ggplot(aes(x = pvalue)) +
+  geom_histogram(bins = 50) +
+  facet_wrap(~ measure) +
+  theme_bw() +
+  ggtitle("Evidence for QTLs effecting abundance but not age-related changes",
+          subtitle = "P-value distributions for whether any QTLs are detected")
+```
+
+```{r fdr}
+calculate_fdr_cutoff <- function (qthresh_data, target_fdr = 0.1) {
+
+  qvals <- qvalue::qvalue(pmax(qthresh_data$pvalue, 0.01))
+  disc_pvals <- qvals$pvalues[qvals$qvalues < target_fdr]
+  
+  if (length(disc_pvals) == 0) {
+    return (NA_real_)
+  } else {
+    return (max(qvals$pvalues[qvals$qvalues < target_fdr]))  
+  }
+}
+
+# refactor to calculate FDR for each measure and q threshold separately
+measure_nest <- qtl_results %>%
+  tidyr::nest(qthresh_data = -c(measure, q_thresholds)) %>%
+  dplyr::mutate(
+    fdr_controlled_at_0.1 = purrr::map_dbl(qthresh_data, calculate_fdr_cutoff, target_fdr = 0.1),
+    fdr_controlled_at_0.2 = purrr::map_dbl(qthresh_data, calculate_fdr_cutoff, target_fdr = 0.2)
+    )
+
+fdr_controls <- dplyr::bind_rows(
+  measure_nest %>%
+    dplyr::filter(
+      !is.na(fdr_controlled_at_0.2),
+      fdr_controlled_at_0.2 >= 1 - q_thresholds
+    ) %>%
+    dplyr::slice(1) %>%
+    dplyr::mutate(label = "20% FDR") %>%
+    dplyr::select(measure, q_thresholds, label),
+  measure_nest %>%
+    dplyr::filter(
+      !is.na(fdr_controlled_at_0.1),
+      fdr_controlled_at_0.1 >= 1 - q_thresholds
+    ) %>%
+    dplyr::slice(1) %>%
+    dplyr::mutate(label = "10% FDR") %>%
+    dplyr::select(measure, q_thresholds, label)
+)
+
+qtl_results %>%
+  tidyr::unnest(sig_loci) %>%
+  filter(!is.na(lodindex)) %>%
+  dplyr::count(measure, q_thresholds) %>%
+  dplyr::left_join(fdr_controls, by = c("measure", "q_thresholds")) %>%
+  ggplot(aes(x = q_thresholds, y = n, fill = label)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ measure) +
+  ggtitle("# of associations at a given QTL significance cutoff")
+```
+
+## Hotspots
+
+```{r find_hotspots, fig.height = 4, fig.width = 10}
+qtl_loci <- qtl_results %>%
+  tidyr::unnest(sig_loci) %>%
+  filter(!is.na(lodindex)) %>%
+  dplyr::inner_join(fdr_controls, by = c("measure", "q_thresholds")) %>%
+  dplyr::filter(label == "10% FDR") %>%
+  dplyr::mutate(qtl_id = 1:n()) %>%
+  # pull out genic identifiers
+  mutate(protein_name_string = stringr::str_match(feature_name, "[A-Z0-9]+_[A-Z0-9]+_MOUSE$")) %>%
+  separate(protein_name_string, into = c("uniprot", "symbol", "species")) %>%
+  mutate(feature_name = stringr::str_replace(feature_name, "^tr_", "")) %>%
+  mutate(genename = stringr::str_match(feature_name, "^[A-Za-z0-9]+")[,1])
+
+# find additional metadata
+
+# uniprot > entrez
+entrez_to_uniprot <- toTable(org.Mm.egUNIPROT) %>%
+  as_tibble()
+
+entrez_to_symbol <- toTable(org.Mm.egSYMBOL) %>%
+  as_tibble()
+
+gene_positions <- toTable(org.Mm.egCHRLOC) %>%
+  as_tibble() %>%
+  mutate(
+    pos_Mb = abs(start_location) / 1e6,
+    strand = ifelse(start_location > 0, 1, -1)
+    ) %>%
+  group_by(gene_id) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  mutate(Chromosome = factor(Chromosome, levels = levels(qtl_loci$chr))) %>%
+  filter(!is.na(Chromosome))
+  
+features_to_locus <- bind_rows(
+  qtl_loci %>%
+    mutate(genename = stringr::str_to_title(genename)) %>%
+    inner_join(entrez_to_symbol, by = c("genename" = "symbol")),
+  qtl_loci %>%
+    inner_join(entrez_to_uniprot, by = c("uniprot" = "uniprot_id"))
+) %>%
+  distinct(feature_name, genename, gene_id) %>%
+  left_join(gene_positions, by = "gene_id") %>%
+  # unique mapping
+  group_by(feature_name) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+qtl_loci_types <- qtl_loci %>%
+  dplyr::left_join(features_to_locus %>% dplyr::select(-genename), by = "feature_name") %>%
+  dplyr::mutate(qtl_type = dplyr::case_when(
+    genename == "n" ~ "mQTL",
+    is.na(Chromosome) ~ "pQTL (unknown ORF)",
+    chr == Chromosome & abs(pos - pos_Mb) < 10 ~ "local pQTL",
+    TRUE ~ "trans pQTL"
+  ),
+  qtl_type = factor(qtl_type, levels = c("mQTL", "local pQTL", "trans pQTL", "pQTL (unknown ORF)"))
+  )
+  
+qtl_plot <- ggplot(qtl_loci_types, aes(x = pos, y = lod, color = qtl_type)) +
+  geom_point(size = 2) +
+  geom_blank(data = gene_positions %>% dplyr::select(pos = pos_Mb, chr = Chromosome) %>% mutate(lod = 10, qtl_type = NA)) +
+  scale_color_manual("QTL Type", values = wesanderson::wes_palette("GrandBudapest1"), breaks = levels(qtl_loci_types$qtl_type)) +
+  scale_x_continuous("QTL Position") +
+  scale_y_continuous("LOD") +
+  facet_grid(~ chr, scales = "free_x", space = "free_x") +
+  theme_bw() +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "bottom") +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+qtl_plot
+create_and_upload_figure(
+  name = "qtl_plot",
+  params = params,
+  drive_path = "Figures/Figure2/Supp",
+  width = 10,
+  height = 4,
+  extensions = c(".pdf", ".png")
+)
+
+# upload table to gDrive
+if (params$update_figures) {
+  
+  qtl_hits_local_path <- file.path(params$figures_dir, "ST2_qtls.tsv")
+  readr::write_tsv(qtl_loci_types, file = qtl_hits_local_path)
+  
+  calibase::upload_to_drive(
+    media = qtl_hits_local_path,
+    drive_path = "Tables",
+    drive_root = params$manuscript_drive_root
+  )
+}
+
+```
