@@ -6,9 +6,10 @@ library(shiny)
 source("interactive.R")
 
 # read results from GCP
-domics_paths <- read_gcp_modeling_results(outdir = "/tmp", overwrite = FALSE)
-model_signif <- readRDS(domics_paths$local_path[domics_paths$type == "signif"])
-features_with_design <- readRDS(domics_paths$local_path[domics_paths$type == "features"])
+overwrite = FALSE
+features_with_design <- load_doomics_shiny("features")
+model_signif <- load_doomics_shiny("signif") %>%
+  semi_join(features_with_design, by = c("data_modality", "groupId")) 
 
 # populate data modalities
 data_modalities <- unique(model_signif$data_modality)
