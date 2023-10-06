@@ -29,16 +29,13 @@ source("manuscript_prep_utils.R")
 # setup global parameters and credentials
 params <- setup_figure_params()
 
-# read results from GCP and locally cache results
-domics_paths <- read_gcp_modeling_results(outdir = file.path(params$cache_dir, "data"), overwrite = FALSE)
-
 # load specific files
-tidy_omics <- load_domics("tomic", domics_paths)
-domics_signif <- load_domics("signif", domics_paths)
-feature_design_list <- load_domics("feature_design_list", domics_paths)
-features_with_design <- load_domics("features", domics_paths)
-
-signif_all_models <- load_domics("signif_all_models", domics_paths)
+tidy_omics <- load_doomics("tomic", params$cache_dir)
+domics_signif <- load_doomics("signif", params$cache_dir)
+feature_design_list <- load_doomics("feature_design_list", params$cache_dir)
+features_with_design <- load_doomics("features", params$cache_dir)
+signif_all_models <- load_doomics("signif_all_models", params$cache_dir)
+mouse_phenotypes <- load_doomics("mouse_phenotypes", params$cache_dir)$mouse_phenotypes_full
 
 features <- romic::get_tomic_table(tidy_omics, "features") %>%
   add_feature_label(feature_design_list)
@@ -51,8 +48,8 @@ figure_4_out <- readRDS(file = file.path(params$cache_dir, "figure_4_out.RDS"))
 
 # functions for bootstrapped regression
 library(patchwork)
-source(file.path(params$repo_path, "utils/data_prep.R"))
-source(file.path(params$repo_path, "3_interactive", "results_browser", "interactive.R"))
+#source(file.path(params$repo_path, "bioinformatics", "utils", "data_prep.R"))
+source(file.path(params$repo_path, "bioinformatics", "3_interactive", "results_browser", "interactive.R"))
 
 # if FALSE then re-use bootstrapped regression results
 overwrite = FALSE
@@ -121,11 +118,10 @@ go_catered_measures_grob <- go_age_measures_list$go_catered_measures %>%
 go_catered_measures_grob
 create_and_upload_figure(
   name = "go_catered_measures",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure5/Supp",
   width = 9,
   height = 9,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 
@@ -137,11 +133,10 @@ go_fll_measures_grob <- go_age_measures_list$go_fll_measures %>%
 go_fll_measures_grob
 create_and_upload_figure(
   name = "go_fll_measures",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure5",
   width = 9,
   height = 9,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -227,11 +222,10 @@ pathway_delta_age_explained_grob <- delta_age_grob / igf_delta_age_grob &
 pathway_delta_age_explained_grob
 create_and_upload_figure(
   name = "pathway_delta_age_explained",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure5/Supp",
   width = 9,
   height = 11,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```
@@ -240,13 +234,7 @@ create_and_upload_figure(
 ## Lifespan Correlations
 
 ```{r setup_glasso_feature_matrix}
-##### read SHOCK phenotypes for context
- 
-# TO DO - if retained then phenotypes should be exported to GCS
-mouse_phenotypes <- load_mouse_phenotypes(params$shock_token, reduced_phenotypes = FALSE)
-
 # map from mouse phenotypes to unique_sample_id
-
 gglasso_sample_data <- samples %>%
   dplyr::filter(!is_ddm_sample)
 
@@ -295,10 +283,6 @@ lifespan_hits_features <- figure_4_out$longevity_features_to_top_pathway %>%
     # select which features to label
     hit_label = dplyr::case_when(
       select_hit_label ~ feature_label,
-      #lifespan < 0.01 ~ feature_label,
-      #`late age x lifespan` < 0.01 ~ feature_label,
-      #stringr::str_detect(feature_label, "^\\(\\-\\) unk") & data_modality == "lipidomics" ~ feature_label,
-      #data_modality == "non-omics" ~ feature_label,
       TRUE ~ NA_character_
     ),
     category_label = forcats::fct_na_value_to_level(category_label, level = "Non-omics phenotypes"),
@@ -371,8 +355,6 @@ my_palette <- colorRampPalette(c("steelblue1", "black", "yellow"))(n = 1000)
 heatmap_local_path <- file.path(params$figures_dir, "correlation_heatmap.pdf")
 pdf(heatmap_local_path, height = 10, width = 10)
 
-# saveRDS(cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs"), "/tmp/lifespan_correlations.Rds")
-
 cor(t(lifespan_hit_matrix), use = "pairwise.complete.obs") %>%
   gplots::heatmap.2(
     trace = "none",
@@ -394,12 +376,14 @@ legend(
   )
 dev.off()
 
-calibase::upload_to_drive(
-  heatmap_local_path,
-  drive_path = "Figures/Figure5/Supp",
-  drive_root = params$manuscript_drive_root,
-  delete_existing_versions = TRUE
-)
+if (params$update_figures) {
+  calibase::upload_to_drive(
+    heatmap_local_path,
+    drive_path = "Figures/Figure5/Supp",
+    drive_root = params$manuscript_drive_root,
+    delete_existing_versions = TRUE
+  )
+}
 ```
 
 ```{r aging_corr_structure_summary}
@@ -521,11 +505,10 @@ glasso_lambda_selection_grob <- lambdas %>%
 glasso_lambda_selection_grob
 create_and_upload_figure(
   name = "glasso_lambda_selection_grob",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure5/Supp",
   width = 5,
   height = 5,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 
@@ -581,7 +564,6 @@ top_partial_corrs %>%
   slice(1:10) %>%
   knitr::kable(caption = "Table of top partial correlations") %>%
   kableExtra::kable_styling()
-
 ```
 
 ## Visualize Partial Correlation Graph
@@ -671,11 +653,10 @@ clean_lifespan_graph_unlabelled <- lifespan_graph +
 clean_lifespan_graph_unlabelled
 create_and_upload_figure(
   name = "clean_lifespan_graph_unlabelled",
+  params = params,
   drive_path = "Figures/Figure5/Extras",
-  update_figures = params$update_figures,
   width = 12,
   height = 12,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )   
   
@@ -699,11 +680,10 @@ clean_lifespan_graph <- clean_lifespan_graph_unlabelled +
 clean_lifespan_graph
 create_and_upload_figure(
   name = "lifespan_graph",
+  params = params,
   drive_path = "Figures/Figure5",
-  update_figures = params$update_figures,
   width = 14,
   height = 14,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )    
 ```
@@ -727,11 +707,10 @@ busy_lifespan_graph <- clean_lifespan_graph_unlabelled +
 busy_lifespan_graph
 create_and_upload_figure(
   name = "lifespan_graph_busy",
-  update_figures = params$update_figures,
+  params = params,
   drive_path = "Figures/Figure5/Supp",
   width = 40,
   height = 40,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 ) 
 ```
@@ -909,11 +888,10 @@ cross_category_distinctness_plot <- ggraph::ggraph(
 cross_category_distinctness_plot
 create_and_upload_figure(
   name = "cross_category_distinctness_plot",
+  params = params,
   drive_path = "Figures/Figure5/Supp",
-  update_figures = params$update_figures,
   width = 10,
   height = 10,
-  tmp_figure_dir = params$figures_dir,
   extensions = c(".png", ".pdf")
 )
 ```

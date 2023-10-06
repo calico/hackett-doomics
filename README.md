@@ -29,3 +29,6 @@ Analyses are divided into two major phases:
 4. Running any of the notebooks in "major_analyses" will download and cache the studies intermediate data files.
 5. major_analyses can be run in order to generate nearly all figures and tables in the manuscript. To do this run figure_1.qmd > figure_2.qmd > figure_3.qmd, etc. Analyses with a suffix, e.g., figure_2_batch.qmd are meant to be run after the corresponding primary file (in this case figure_2.qmd). Rendered versions of all notebooks can be seen above.
 
+### Debugging
+
+All of the files which are needed to run the *major_analyses* are automatically downloaded from Google Cloud Storage. They will be downloaded when first loaded and cached for subsequent use. Most are <100MB but a couple of files are >1 GB. If your internet is slow and it takes longer than 60 seconds to download a file then R will abort the download leaving a partially downloaded file. If this happens then delete this incomplete file, and set `options("timout" = 10000)`.

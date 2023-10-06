@@ -25,8 +25,17 @@ setup_figure_params <- function (config_path = "config.json") {
   
   params <- list(
     # thks will be an empty string if you have not set this variable
-    manuscript_drive_root = Sys.getenv("doomics_manuscript_uri")
+    manuscript_drive_root = Sys.getenv("doomics_manuscript_uri"),
+    repo_path = dirname(getwd())
   )
+  
+  if (basename(params$repo_path) != "hackett-doomics") {
+    cli::cli_abort(
+      "Something went wrong, the directory above the working
+      directory should be the repo root named {.var hackett-doomics} but
+      it was {.path {params$repo_path}}
+      ")
+  }
   
   params$cache_dir <- cache_dir
   checkmate::assertDirectoryExists(params$cache_dir, access = "w")
@@ -45,7 +54,7 @@ setup_figure_params <- function (config_path = "config.json") {
     params$update_figures <- TRUE
     
     # drive ID for manuscript figures and other assets
-    if (manuscript_drive_root == "") {
+    if (params$manuscript_drive_root == "") {
       cli::cli_abort(
         "{.var manuscript_drive_root} must be set in the .Renviron
         to export results to gDrive. This process is only supported
@@ -84,17 +93,25 @@ load_doomics <- function (
     ~ asset, ~ object, ~ public_url, ~ description,
     "all_model_signif", "all_model_signif.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/all_model_signif.Rds", "FDR-controlled terms for all models",
     "normalized_peaks", "all_normalized_peaks.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/all_normalized_peaks.Rds", "peak level summaries of alternative normalization approaches for metabolomics and lipidomics",
-    "qtl_results", "all_qtl_results.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/all_qtl_results.Rds", "QTL lod profiles and null distributions for ~2200 molecules' abundances",   
+    "gene_sets", "gene_sets", list(
+      "m2.cp.reactome.v2022.1.Mm.entrez.gmt" = "https://storage.googleapis.com/calico-hackett-doomics-public/genesets/m2.cp.reactome.v2022.1.Mm.entrez.gmt",
+      "m5.go.bp.v2022.1.Mm.entrez.gmt" = "https://storage.googleapis.com/calico-hackett-doomics-public/genesets/m5.go.bp.v2022.1.Mm.entrez.gmt"
+    ), "Mouse genesets from MSigDB; these are bundled here to facilitate reproducible research. The primary source is http://www.gsea-msigdb.org/gsea/downloads.jsp.",
+    "qtl_data", "all_qtl_results.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/all_qtl_results.Rds", "QTL lod profiles and null distributions for ~2200 molecules' abundances",   
     "feature_design_list", "feature_design_list.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/feature_design_list.Rds", "Extra metadata for individual data modalities",
     "features_extended", "features_with_design.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/features_with_design.Rds", "Measurements of all features in all samples (including data modalities not discussed in manuscript - Olink, and peptide-level analysis)",
     "features", "features_with_design_core.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/features_with_design_core.Rds", "Measurements of all features in all samples",
+    "mouse_phenotypes", "mouse_phenotypes.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/mouse_phenotypes.Rds", "Mouse- and blood-draw-level phenotypes in both a reduced and comprehensive format.",
+    "genetic_map", "genetic_map.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/genetic_map.Rds", "Genetic map mapping markers onto genomic coordinates",
+    "protein_annotations", "proteomics_features_annotated.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/proteomics_features_annotated.Rds", "Protein annotatoins based on curating proteins associated with aging",
     "signif_all_models", "lm_models.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/lm_models.Rds", "Model-level summaries of all regressions",
     "signif", "model_signif.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/model_signif.Rds", "FDR-controlled terms for selected coefficients",
     "select_informatics_plots", "select_informatics_plots", list(
       "batch_post_correction-1.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/batch_post_correction-1.png",
       "metabolites-neg_injection_comparison.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/metabolites-neg_injection_comparison.png",
       "metabolites-pos_injection_comparison.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/metabolites-pos_injection_comparison.png",
-      "tmt_ra_correlations-1.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/tmt_ra_correlations-1.png"
+      "tmt_ra_correlations-1.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/tmt_ra_correlations-1.png",
+      "tmt_bridge_correlations-1.png" = "https://storage.googleapis.com/calico-hackett-doomics-public/select_informatics_plots/tmt_bridge_correlations-1.png"
     ), "Figures generated upstream which can be downloaded from GCS",
     "tomic_extended", "tidy_features.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/tidy_features.Rds", "features, samples, and measurements list (including data modalities not discussed in manuscript - Olink, and peptide-level analysis)",
     "tomic", "tidy_features_core.Rds", "https://storage.googleapis.com/calico-hackett-doomics-public/tidy_features_core.Rds", "features, samples, and measurements list",
@@ -146,10 +163,15 @@ load_doomics <- function (
   if (class(payload) == "character") {
     utils::download.file(payload, destfile = asset_local_path)
   } else if (class(payload) == "list") {
+    
+    if (!(dir.exists(asset_local_path))) {
+      dir.create(asset_local_path, recursive = TRUE)
+    }
+    
     purrr::walk2(
       names(payload),
       unname(payload),
-      ~ utils::download.file(.y, file.path(outdir, .x))
+      ~ utils::download.file(.y, file.path(asset_local_path, .x))
       )
   } else {
     cli::cli_abort("public_url is a {.val {class(payload)[1]}} and must be a character or list")
@@ -158,7 +180,7 @@ load_doomics <- function (
   return(return_functional(asset_local_path))
 }
 
-create_and_upload_figure <- function (grob = NULL, params, name, drive_path, width, height, tmp_figure_dir = "/tmp", extensions = ".pdf") {
+create_and_upload_figure <- function (grob = NULL, params, name, drive_path, width, height, extensions = ".pdf") {
   
   # ggsave to a local file and add local plots to gDrive if update_figures is TRUE
   
@@ -167,7 +189,7 @@ create_and_upload_figure <- function (grob = NULL, params, name, drive_path, wid
   }
   checkmate::assertClass(grob, "ggplot")
   
-  checkmate::assertLogical(update_figures, len = 1)
+  checkmate::assertLogical(params$update_figures, len = 1)
   if (!params$update_figures) {
     # no upload needed
     return (NULL)
@@ -176,19 +198,20 @@ create_and_upload_figure <- function (grob = NULL, params, name, drive_path, wid
   checkmate::assertCharacter(extensions)
   purrr::walk(extensions, checkmate::assertChoice, choices = c(".pdf", ".png", ".eps"))
   
-  checkmate::assertPathForOutput(file.path(tmp_figure_dir, "foo.txt"))
+  checkmate::assertString(params$figures_dir)
+  checkmate::assertPathForOutput(file.path(params$figures_dir, "foo.txt"))
   checkmate::assertString(name)
   checkmate::assertNumber(width)
   checkmate::assertNumber(height)
   
-  manuscript_drive_root <- googledrive::as_id(params$manuscript_drive_root)
+  manuscript_drive_root_con <- googledrive::as_id(params$manuscript_drive_root)
   
   plots_to_save <- tibble::tibble(
     extension = extensions
   ) %>%
     mutate(
       filename = glue::glue("{name}{extension}"),
-      localpath = file.path(tmp_figure_dir, filename)
+      localpath = file.path(params$figures_dir, filename)
     )
   
   if (".pdf" %in% extensions) {
@@ -212,7 +235,7 @@ create_and_upload_figure <- function (grob = NULL, params, name, drive_path, wid
     plots_to_save$localpath,
     calibase::upload_to_drive,
     drive_path = drive_path,
-    drive_root = manuscript_drive_root
+    drive_root = manuscript_drive_root_con
   )
 }
 
